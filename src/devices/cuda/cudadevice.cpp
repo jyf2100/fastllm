@@ -6199,7 +6199,9 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
 
-        AssertInFastLLM(weight.dims.size() == 2, "Linear's weight's shape's size should be 2.\n");
+        AssertInFastLLM(weight.dims.size() == 2,
+                        "Linear's weight's shape's size should be 2. (weight: " +
+                            weight.name + ")\n");
         AssertInFastLLM(input.dims.back() == weight.dims[1], "Linear's weight's shape error.\n");
         DoCudaLinearReshape(input, weight, output);
     }
