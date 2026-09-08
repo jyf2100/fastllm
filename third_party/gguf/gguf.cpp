@@ -1017,6 +1017,18 @@ namespace fastllm {
             std::string name = tensors[i].first.name;
             bool matched = false;
 
+            // llama.cpp squeezes [1, N] router matrices (ffn_gate_inp_shexp)
+            // down to 1-D when writing GGUF files.  The consumers feed that
+            // weight to Linear, which requires the 2-D [1, N] layout the HF
+            // checkpoints use.  The memory layout is identical, so restore
+            // the rank in the metadata.
+            static const std::string shexpGateSuffix = "ffn_gate_inp_shexp.weight";
+            if (name.size() >= shexpGateSuffix.size() &&
+                name.compare(name.size() - shexpGateSuffix.size(), shexpGateSuffix.size(), shexpGateSuffix) == 0 &&
+                tensors[i].first.dims.size() == 1) {
+                tensors[i].first.dims = {1, tensors[i].first.dims[0]};
+            }
+
             for (auto &it : weightNameConverterRules) {
                 if (std::regex_search(name, it.pattern)) {
                     matched = true;

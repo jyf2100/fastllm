@@ -537,6 +537,36 @@ namespace fastllm {
             }
         }
 
+        // Qwen3.5 MoE blocks reuse the dense qwen3_5 layout (hybrid GDN /
+        // full attention, nextn roots) and add the router, shared expert and
+        // packed routed experts on top.  Build the rule set from the dense
+        // entry instead of duplicating it.
+        if (archRulesDict.find("qwen35moe") == archRulesDict.end()) {
+            auto rules = originalArchRulesDict["qwen3_5"];
+            const std::vector <GGUFWeightReplaceRule> moeRules = {
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_gate_inp\.weight$)"),
+                    "model.language_model.layers.$1.mlp.gate.weight"
+                ),
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_gate_inp_shexp\.weight$)"),
+                    "model.language_model.layers.$1.mlp.shared_expert_gate.weight"
+                ),
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_shexp\.weight$)"),
+                    "model.language_model.layers.$1.mlp.shared_expert.$2_proj.weight"
+                ),
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$)"),
+                    std::vector <std::string> ({"model.language_model.layers.$1.mlp.experts.", ".$2_proj.weight"}),
+                    GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                ), // routed experts
+            };
+            rules.insert(rules.end(), moeRules.begin(), moeRules.end());
+            archRulesDict["qwen35moe"] = rules;
+            archRulesDict["qwen3_5_moe"] = rules;
+        }
+
         if (archRulesDict.find(arch) != archRulesDict.end()) {
             return archRulesDict[arch];
         }

@@ -3511,8 +3511,14 @@ namespace fastllm {
         // gate/up and q/k/v merge rules skip, and the MTP forward needs the
         // fused tensors to exist.  Dequantize the MTP block's matrices to
         // FP16 so the merges always apply; the stack is a single layer, so
-        // the extra memory stays bounded.
+        // the extra memory stays bounded.  Floating-point sources (e.g. an
+        // F32 router) merge fine as-is and ggml_type_to_float has no
+        // identity path for them, so leave those on Direct.
         auto forceMtpMatrixFP16 = [&task]() {
+            if (task.tensor.type == ggml_type::GGML_TYPE_F32 ||
+                task.tensor.type == ggml_type::GGML_TYPE_F16) {
+                return;
+            }
             if (task.tensor.ne[1] > 1 && task.tensor.ne[2] <= 1 &&
                 task.tensor.ne[3] <= 1) {
                 task.replaceType =
@@ -3959,7 +3965,8 @@ namespace fastllm {
         uint64_t totalLoadBytes = 0;
         for (int i = 0; i < readGGUFTasks.size(); i++) {
             bool isEmbeddedMtpTask = false;
-            if (arch == "qwen3_5") {
+            if (arch == "qwen3_5" || arch == "qwen35moe" ||
+                arch == "qwen3_5_moe") {
                 isEmbeddedMtpTask = RemapQwen35GGUFMtpTask(
                     readGGUFTasks[i], ggufMainLayerCount,
                     ggufMtpLayerCount);
