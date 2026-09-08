@@ -246,27 +246,189 @@ namespace fastllm {
         return layerId >= firstLayer && layerId < this->block_cnt;
     }
 
+    static bool DeviceNameMatchesType(const std::string &deviceName, const std::string &deviceType);
+
     std::string basellm::SelectMoeDeviceForLayer(int layerId) const {
+        std::string selectedDevice;
         if (this->block_cnt <= 0) {
             if (!this->moeDeviceMap.empty()) {
-                return SelectDeviceFromMap(this->moeDeviceMap, 1, 1);
+                selectedDevice = SelectDeviceFromMap(this->moeDeviceMap, 1, 1);
+            } else {
+                selectedDevice = SelectDeviceFromMap(this->deviceMap, 1, 1);
             }
-            return SelectDeviceFromMap(this->deviceMap, 1, 1);
-        }
-
-        if (this->UseLayeredMoeDevice(layerId)) {
+        } else if (this->UseLayeredMoeDevice(layerId)) {
             int layeredLayers = std::min(this->moeDeviceLayers, this->block_cnt);
             int firstLayer = this->block_cnt - layeredLayers;
-            return SelectDeviceFromMap(this->layeredMoeDeviceMap, layerId - firstLayer + 1, layeredLayers);
+            selectedDevice = SelectDeviceFromMap(this->layeredMoeDeviceMap, layerId - firstLayer + 1, layeredLayers);
+        } else {
+            const auto &frontMap = this->moeDeviceMap.empty() ? this->deviceMap : this->moeDeviceMap;
+            int frontLayers = this->block_cnt;
+            if (this->moeDeviceLayers >= 0) {
+                int layeredLayers = std::min(std::max(this->moeDeviceLayers, 0), this->block_cnt);
+                frontLayers = std::max(1, this->block_cnt - layeredLayers);
+            }
+            selectedDevice = SelectDeviceFromMap(frontMap, std::min(layerId + 1, frontLayers), frontLayers);
         }
 
-        const auto &frontMap = this->moeDeviceMap.empty() ? this->deviceMap : this->moeDeviceMap;
-        int frontLayers = this->block_cnt;
-        if (this->moeDeviceLayers >= 0) {
-            int layeredLayers = std::min(std::max(this->moeDeviceLayers, 0), this->block_cnt);
-            frontLayers = std::max(1, this->block_cnt - layeredLayers);
+        if (DeviceNameMatchesType(selectedDevice, "cuda") &&
+            this->IsMoeLayerSpilledToCpu(layerId)) {
+            return "cpu";
         }
-        return SelectDeviceFromMap(frontMap, std::min(layerId + 1, frontLayers), frontLayers);
+        return selectedDevice;
+    }
+
+    bool basellm::IsMoeLayerSpilledToCpu(int layerId) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (layerId < 0 || layerId >= this->block_cnt || this->block_cnt <= 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(this->moeCudaSpillLock);
+        if (!this->moeCudaSpillPlanComputed) {
+            this->ComputeMoeCudaSpillPlan();
+        }
+        return this->moeCudaSpillLayers.find(layerId) != this->moeCudaSpillLayers.end();
+#else
+        (void)layerId;
+        return false;
+#endif
+    }
+
+    static int GetMoeExpertWeightLayerId(const basellm *model, const std::string &weightName) {
+        // Direct merged-name registration (e.g. experts.N.gateup_proj.weight).
+        auto layerIt = model->specialWeightLayerIds.find(weightName);
+        if (layerIt != model->specialWeightLayerIds.end() && layerIt->second >= 0) {
+            return layerIt->second;
+        }
+        // Merge-rule inputs (e.g. per-expert gate_proj/up_proj) resolve
+        // through their merged output's registration, mirroring the device
+        // routing in GetMoeWeightSelectedDevice.
+        if (model->moeLinears.find(weightName) == model->moeLinears.end()) {
+            return -1;
+        }
+        for (auto &mergeRule : model->weightMergeRules) {
+            for (auto &rule : mergeRule.rules) {
+                if (std::find(rule.inputs.begin(), rule.inputs.end(), weightName) == rule.inputs.end()) {
+                    continue;
+                }
+                layerIt = model->specialWeightLayerIds.find(rule.output);
+                if (layerIt != model->specialWeightLayerIds.end() && layerIt->second >= 0) {
+                    return layerIt->second;
+                }
+            }
+        }
+        return -1;
+    }
+
+    void basellm::ComputeMoeCudaSpillPlan() const {
+        // Caller holds moeCudaSpillLock.
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (this->block_cnt <= 0 || this->specialWeightLayerIds.empty()) {
+            return;
+        }
+
+        // Fallback path: derive sizes from the resident weight map.  Only
+        // trustworthy once weights are fully loaded (GGUF streaming lands
+        // tensors on CPU one by one; before that the entries are {1}-dim
+        // placeholders).
+        std::vector<uint64_t> layerBytes(this->block_cnt, 0);
+        uint64_t expertBytes = 0;
+        for (const auto &it : this->specialWeightLayerIds) {
+            if (it.second < 0 || it.second >= this->block_cnt) {
+                continue;
+            }
+            auto weightIt = this->weight.weight.find(it.first);
+            if (weightIt == this->weight.weight.end() ||
+                weightIt->second.dims.empty()) {
+                continue;
+            }
+            uint64_t bytes = weightIt->second.GetBytes();
+            layerBytes[it.second] += bytes;
+            expertBytes += bytes;
+        }
+        if (expertBytes == 0) {
+            // Weights are not loaded yet; do not freeze the plan so a later
+            // call can compute it against the real tensor sizes.
+            return;
+        }
+        uint64_t totalWeightBytes = 0;
+        for (const auto &it : this->weight.weight) {
+            totalWeightBytes += it.second.GetBytes();
+        }
+        this->BuildMoeCudaSpillPlanLocked(layerBytes, expertBytes, totalWeightBytes);
+#endif
+    }
+
+    void basellm::FinalizeMoeCudaSpillPlan(
+            const std::vector<std::pair<std::string, uint64_t>> &tensorNameAndBytes) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        std::lock_guard<std::mutex> guard(this->moeCudaSpillLock);
+        if (this->moeCudaSpillPlanComputed || this->block_cnt <= 0 ||
+            tensorNameAndBytes.empty()) {
+            return;
+        }
+        // GGUF loader hook: tensor sizes come from the read tasks (true
+        // ggml_nbytes) before any data streams in, so the plan is final
+        // before the first streamed weight consults SelectMoeDeviceForLayer.
+        std::vector<uint64_t> layerBytes(this->block_cnt, 0);
+        uint64_t expertBytes = 0;
+        uint64_t totalWeightBytes = 0;
+        for (const auto &it : tensorNameAndBytes) {
+            totalWeightBytes += it.second;
+            int layerId = GetMoeExpertWeightLayerId(this, it.first);
+            if (layerId >= 0 && layerId < this->block_cnt) {
+                layerBytes[layerId] += it.second;
+                expertBytes += it.second;
+            }
+        }
+        if (expertBytes == 0) {
+            return;
+        }
+        this->BuildMoeCudaSpillPlanLocked(layerBytes, expertBytes, totalWeightBytes);
+#endif
+    }
+
+    void basellm::BuildMoeCudaSpillPlanLocked(const std::vector<uint64_t> &layerBytes,
+                                              uint64_t expertBytes,
+                                              uint64_t totalWeightBytes) const {
+        // Caller holds moeCudaSpillLock.
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        std::vector<long long> totals = FastllmCudaGetTotalSizes();
+        if (totals.empty() || totals[0] <= 0) {
+            return;
+        }
+        const uint64_t capacity = (uint64_t)((double)totals[0] * GetGpuMemRatio());
+        const char *reserveEnv = getenv("FASTLLM_MOE_CUDA_RESERVE_MB");
+        const uint64_t reserveBytes = reserveEnv != nullptr && atoll(reserveEnv) > 0 ?
+            ((uint64_t)atoll(reserveEnv) << 20) : (4096ULL << 20);
+        const uint64_t nonExpertBytes =
+            totalWeightBytes > expertBytes ? totalWeightBytes - expertBytes : 0;
+        const uint64_t expertBudget = capacity > nonExpertBytes + reserveBytes ?
+            capacity - nonExpertBytes - reserveBytes : 0;
+
+        uint64_t placedBytes = 0;
+        int placedLayers = 0;
+        for (int i = 0; i < (int)layerBytes.size(); i++) {
+            if (layerBytes[i] == 0) {
+                continue;
+            }
+            placedBytes += layerBytes[i];
+            if (placedBytes <= expertBudget) {
+                placedLayers++;
+            } else {
+                this->moeCudaSpillLayers.insert(i);
+            }
+        }
+        this->moeCudaSpillPlanComputed = true;
+        printf("[Fastllm] MoE cuda spill plan: expert budget %.2f GB "
+               "(experts %.2f GB, non-experts %.2f GB), "
+               "%d/%d moe layers on cuda, %zu spilled to cpu (reserve %.2f GB).\n",
+               expertBudget / (1024.0 * 1024.0 * 1024.0),
+               expertBytes / (1024.0 * 1024.0 * 1024.0),
+               nonExpertBytes / (1024.0 * 1024.0 * 1024.0),
+               placedLayers, (int)layerBytes.size(), this->moeCudaSpillLayers.size(),
+               reserveBytes / (1024.0 * 1024.0 * 1024.0));
+        fflush(stdout);
+#endif
     }
 
     void basellm::ApplyMoeDeviceMapForLayer(int layerId) const {
@@ -3963,6 +4125,7 @@ namespace fastllm {
             }
         }
         uint64_t totalLoadBytes = 0;
+        std::vector<std::pair<std::string, uint64_t>> ggufTensorSizes;
         for (int i = 0; i < readGGUFTasks.size(); i++) {
             bool isEmbeddedMtpTask = false;
             if (arch == "qwen3_5" || arch == "qwen35moe" ||
@@ -3983,8 +4146,15 @@ namespace fastllm {
             model->weight.AddEmptyWeight(weightName, {1}, DataType::FLOAT32);
             readGGUFTasks[i].weight = &model->weight.weight[weightName];
             readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
-            totalLoadBytes += ggml_nbytes(&readGGUFTasks[i].tensor);
+            uint64_t tensorBytes = ggml_nbytes(&readGGUFTasks[i].tensor);
+            totalLoadBytes += tensorBytes;
+            ggufTensorSizes.push_back({weightName, tensorBytes});
         }
+        // The VRAM-aware MoE spill plan must be final before streaming
+        // starts: per-tensor device routing (GetMoeWeightSelectedDevice) and
+        // post-merge special-weight CUDA moves both consult
+        // SelectMoeDeviceForLayer while only part of the model is in memory.
+        model->FinalizeMoeCudaSpillPlan(ggufTensorSizes);
         if (externalMtpSafeTensors != nullptr) {
             auto externalMtpTensorNames =
                 externalMtpSafeTensors->GetSortedItemNames();

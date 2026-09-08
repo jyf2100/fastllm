@@ -2327,10 +2327,16 @@ namespace fastllm {
             return GetQwen35GPUForwardDevices(deviceMap, devices, ratios);
         }
 
-        static bool Qwen35CanPlanFusedMoe(const std::map<std::string, int> &deviceMap,
+        static bool Qwen35CanPlanFusedMoe(const Qwen3_5Model *model,
+                                          const std::map<std::string, int> &deviceMap,
                                           const std::map<std::string, int> &moeDeviceMap) {
-            return Qwen35CanUseGPUForward(deviceMap, moeDeviceMap) &&
-                   Qwen35MoeDeviceMapAllowsCudaOnly(moeDeviceMap);
+            return model != nullptr &&
+                   Qwen35CanUseGPUForward(deviceMap, moeDeviceMap) &&
+                   Qwen35MoeDeviceMapAllowsCudaOnly(moeDeviceMap) &&
+                   // The VRAM-aware spill plan redirects tail layers to CPU;
+                   // the fused 3D expert path has no per-layer fallback, so
+                   // require the plain all-CUDA selection here.
+                   Qwen35ModelMoeLayersAllowCudaOnly(model);
         }
 
         static bool GetQwen35ThreadTpDevices(const std::map<std::string, int> &deviceMap,
@@ -15356,7 +15362,7 @@ namespace fastllm {
         mtpTargetProfileMark(mtpTargetProfileSetupUs);
         if (num_experts > 0) {
             if (!Qwen35MoeDisableFusedMoe() &&
-                Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap)) {
+                Qwen35CanPlanFusedMoe(this, this->deviceMap, this->moeDeviceMap)) {
                 TryBuildFusedMoeWeightsFromLoaded();
             }
             PrepareMoeWeights();
@@ -24244,7 +24250,7 @@ namespace fastllm {
         std::map<int, int> ratios;
         bool prepareCuda = !Qwen35MoeDisableFusedMoe() &&
             !Qwen35LayerUsesMappedNonCudaMoe(this, layer) &&
-            Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) &&
+            Qwen35CanPlanFusedMoe(this, this->deviceMap, this->moeDeviceMap) &&
             GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
             !devices.empty();
         if (prepareCuda && Qwen35MoeAllExpertsReady(moeGate3DExpertReady, layer, this->num_experts) &&
@@ -24416,7 +24422,7 @@ namespace fastllm {
         std::map<int, int> ratios;
         bool prepareCuda = !Qwen35MoeDisableFusedMoe() &&
             !Qwen35LayerUsesMappedNonCudaMoe(this, layer) &&
-            Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) &&
+            Qwen35CanPlanFusedMoe(this, this->deviceMap, this->moeDeviceMap) &&
             GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
             !devices.empty();
         DivisionScheme interScheme;
@@ -24832,7 +24838,7 @@ namespace fastllm {
         }
 
         if (Qwen35MoeDisableFusedMoe() ||
-            !Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) ||
+            !Qwen35CanPlanFusedMoe(this, this->deviceMap, this->moeDeviceMap) ||
             block_cnt <= 0 || this->num_experts <= 0) {
             return;
         }

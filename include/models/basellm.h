@@ -11,6 +11,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <set>
 
 #ifdef PY_API
 #include "Python.h"
@@ -568,9 +569,25 @@ namespace fastllm {
         std::map <std::string, int> layeredMoeDeviceMap;
         int moeDeviceLayers = -1;
 
+        // VRAM-aware MoE fallback: when experts are requested on CUDA but
+        // the card cannot hold every layer plus runtime buffers, the tail
+        // layers spill to CPU instead of OOM-ing at load.
+        mutable std::mutex moeCudaSpillLock;
+        mutable std::set<int> moeCudaSpillLayers;
+        mutable bool moeCudaSpillPlanComputed = false;
+        void ComputeMoeCudaSpillPlan() const; // call with moeCudaSpillLock held
+        void BuildMoeCudaSpillPlanLocked(const std::vector<uint64_t> &layerBytes,
+                                         uint64_t expertBytes,
+                                         uint64_t totalWeightBytes) const; // call with moeCudaSpillLock held
+
         void AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId = -1);
         bool UseLayeredMoeDevice(int layerId) const;
         std::string SelectMoeDeviceForLayer(int layerId) const;
+        bool IsMoeLayerSpilledToCpu(int layerId) const;
+        // Freeze the spill plan from the GGUF read tasks (true tensor sizes)
+        // before any streamed weight consults SelectMoeDeviceForLayer.
+        void FinalizeMoeCudaSpillPlan(
+            const std::vector<std::pair<std::string, uint64_t>> &tensorNameAndBytes) const;
         void ApplyMoeDeviceMapForLayer(int layerId) const;
         // Common model integration for the optional CUDA expert cache. A
         // model only supplies its standard MergeMOE tables and identifies
