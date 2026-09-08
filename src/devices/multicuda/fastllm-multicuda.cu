@@ -2,7 +2,10 @@
 // Created by huangyuyang on 8/2/24.
 //
 
+#if !defined(__CUDACC_VER_MAJOR__) || (__CUDACC_VER_MAJOR__ < 13)
+// CUDA 13 移除了 cuda_profiler_api.h；fastllm 未使用其中的 API
 #include <cuda_profiler_api.h>
+#endif
 #include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda_bf16.h>

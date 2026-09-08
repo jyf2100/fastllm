@@ -32,7 +32,10 @@ struct FastllmCudaV41AttentionRequest {
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#if !defined(__CUDACC_VER_MAJOR__) || (__CUDACC_VER_MAJOR__ < 13)
+// CUDA 13 移除了 cuda_profiler_api.h；fastllm 未使用其中的 API
 #include <cuda_profiler_api.h>
+#endif
 #include <cuda.h>
 #include <stdio.h>
 #include <vector>
