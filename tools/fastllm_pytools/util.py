@@ -1577,8 +1577,10 @@ def make_normal_llm_model(args, startup_progress = None):
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
         llm.set_cuda_slab(args.cuda_slab)
     os.environ["FASTLLM_QWEN35_ENABLE_MTP"] = str(mtp)
+    # Qwen3.8-Flash-Next 的 FP8 checkpoint 声明 model_type=qwen4_exp（同架构别名），同样启用 MTP
     os.environ["FASTLLM_QWEN4_ENABLE_MTP"] = str(
-        mtp if is_qwen38_flash_next_model else 0)
+        mtp if (is_qwen38_flash_next_model or model_type == "qwen4_exp" or
+                text_model_type == "qwen4_exp_text") else 0)
     os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):
