@@ -12027,6 +12027,7 @@ namespace fastllm {
 
         auto runWithoutGraph = [&]() -> bool {
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+            FastllmCudaClearGGUFIndexedMoeActive();
             runGraphBody();
             bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
             finishWithLogits();
@@ -12168,6 +12169,7 @@ namespace fastllm {
             }
 
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+            FastllmCudaClearGGUFIndexedMoeActive();
             runGraphBody();
             int bodyFailure =
                 FastllmCudaMergeMOEUsedGraphUnsafeFallback() ?

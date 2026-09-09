@@ -65,6 +65,24 @@ namespace fastllm {
         return cudaMergeMOEUsedGraphUnsafeFallback;
     }
 
+    // The device-indexed GGUF MergeMOE path is graph-capture safe on its own,
+    // but the Qwen3.5 MoE graph optimizer's shared/routed fork-join rewiring
+    // races with the captured MoE kernels and silently corrupts replay
+    // output. The optimizer queries this flag to skip such graphs.
+    static thread_local bool cudaMergeMOEGGUFIndexedActive = false;
+
+    void FastllmCudaMarkGGUFIndexedMoeActive() {
+        cudaMergeMOEGGUFIndexedActive = true;
+    }
+
+    void FastllmCudaClearGGUFIndexedMoeActive() {
+        cudaMergeMOEGGUFIndexedActive = false;
+    }
+
+    bool FastllmCudaGGUFIndexedMoeActive() {
+        return cudaMergeMOEGGUFIndexedActive;
+    }
+
     static uint64_t GetConvertedBufferBytes(const Data &data) {
         uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
         return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
@@ -9566,6 +9584,70 @@ namespace fastllm {
                                                      scoreData, scoresOnCuda, topk, hidden, inter);
     }
 
+    // Device-indexed GGUF fast path: expert ids stay on the GPU and feed a
+    // cached per-layer expert pointer table, so the op never needs the D2H
+    // index sync and stays CUDA-graph safe. Reached before the graph-unsafe
+    // CPU-routing fallback below.
+    static bool TryCudaMergeMOEBatch1GGUFIndexed(
+        Data &input, Data &output, Data &index, Data &score, int topk,
+        Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu) {
+            return false;
+        }
+        if (!IsCudaMergeMoeGGUFInputType(input.dataType) || input.dataDevice != DataDevice::CUDA ||
+            input.dims.size() == 0) {
+            return false;
+        }
+        if (index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            index.cudaData == nullptr ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            score.cudaData == nullptr || topk <= 0) {
+            return false;
+        }
+        if (weights == nullptr || weightsBatch < 4) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        const int hidden = input.dims.back();
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        // gateup/down may use different GGML types (Q4_K_M mix); the device
+        // expert table only requires each role to be uniform across experts.
+        if (gateup == nullptr || down == nullptr ||
+            gateup->dataType != DataType::DATA_GGUF_FORMAT ||
+            down->dataType != DataType::DATA_GGUF_FORMAT ||
+            gateup->ggmlType < 0 || down->ggmlType < 0 ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 || down->dims[0] != hidden) {
+            return false;
+        }
+        int inter = down->dims[1];
+        bool dispatched = false;
+        if (input.dataType == DataType::FLOAT32) {
+            dispatched = FastllmCudaFloatMergeMOEGGUFBatch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                   (const int32_t*)index.cudaData,
+                                                                   (const float*)score.cudaData, topk, hidden, inter);
+        } else if (input.dataType == DataType::FLOAT16) {
+            dispatched = FastllmCudaHalfMergeMOEGGUFBatch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                  (const int32_t*)index.cudaData,
+                                                                  (const float*)score.cudaData, topk, hidden, inter);
+        } else {
+            dispatched = FastllmCudaBFloat16MergeMOEGGUFBatch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                      (const int32_t*)index.cudaData,
+                                                                      (const float*)score.cudaData, topk, hidden, inter);
+        }
+        if (dispatched) {
+            // The Qwen3.5 MoE graph optimizer's shared/routed fork-join rewiring
+            // races with this path's captured kernels and silently corrupts
+            // replay output; keep the flag so the optimizer skips such graphs.
+            FastllmCudaMarkGGUFIndexedMoeActive();
+        }
+        return dispatched;
+    }
+
     static bool TryCudaMergeMOEBatch1Fp8Indexed(
         Data &input, Data &output, Data &index, Data &score, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
@@ -9859,6 +9941,10 @@ namespace fastllm {
                 }
                 if (TryCudaMergeMOEBatch1Fp8Indexed(input, output, index, score, topk,
                                                     w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+                if (TryCudaMergeMOEBatch1GGUFIndexed(input, output, index, score, topk,
+                                                      w1, weights, weightsBatch, sharedScale, gateType)) {
                     return;
                 }
             } else if (batch > 1 && batch <= 64 && index.dims.size() >= 2) {

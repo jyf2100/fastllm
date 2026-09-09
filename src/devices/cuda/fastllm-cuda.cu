@@ -962,6 +962,13 @@ void FastllmCudaGraphMarkQwen35MoeJoin(int layer) {
 }
 
 int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
+    // The fork-join rewiring races with the device-indexed GGUF MergeMOE path
+    // (silently corrupts replay output), and can be disabled manually via env.
+    if (fastllm::FastllmCudaGGUFIndexedMoeActive() ||
+        std::getenv("FASTLLM_MOE_GRAPH_OPT_OFF") != nullptr) {
+        fastllmCudaGraphLastError.clear();
+        return 0;
+    }
     if (graph == nullptr) {
         fastllmCudaGraphLastError = "Qwen3.5 MoE graph optimizer received a null graph";
         return -1;

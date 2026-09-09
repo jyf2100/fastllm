@@ -183,6 +183,16 @@ void FastllmCudaGraphMarkQwen35MoeFork(int layer);
 void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer);
 void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer);
 void FastllmCudaGraphMarkQwen35MoeJoin(int layer);
+
+namespace fastllm {
+// Device-indexed GGUF MergeMOE activity flag: the Qwen3.5 MoE graph optimizer
+// must skip graphs whose captured body used that path (fork-join rewiring
+// races with it and corrupts replay output).
+void FastllmCudaMarkGGUFIndexedMoeActive();
+void FastllmCudaClearGGUFIndexedMoeActive();
+bool FastllmCudaGGUFIndexedMoeActive();
+}
+
 // Returns the number of parallelized layers, the recapture status above, or
 // -1 on an invalid graph/runtime error.
 int FastllmCudaGraphOptimizeQwen35Moe(void *graph);
@@ -1250,6 +1260,9 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
 bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                         fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                         bool scoresOnCuda, int topk, int hidden, int inter);
+bool FastllmCudaFloatMergeMOEGGUFBatch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
+                                               fastllm::Data **weights, int weightsBatch, const int32_t *indices,
+                                               const float *scores, int topk, int hidden, int inter);
 bool FastllmCudaMatMulFloatFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatNVFP4(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -1745,6 +1758,9 @@ bool FastllmCudaHalfGgufMergedGateUpSiluMul(
 bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                        fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                        bool scoresOnCuda, int topk, int hidden, int inter);
+bool FastllmCudaHalfMergeMOEGGUFBatch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
+                                              fastllm::Data **weights, int weightsBatch, const int32_t *indices,
+                                              const float *scores, int topk, int hidden, int inter);
 
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulInt4Group32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -1865,6 +1881,9 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAdd(const fastllm::Data &i
 bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaBFloat16MergeMOEGGUFBatch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
+                                                  fastllm::Data **weights, int weightsBatch, const int32_t *indices,
+                                                  const float *scores, int topk, int hidden, int inter);
 bool FastllmCudaBFloat16MergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                            fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                            bool scoresOnCuda, int topk, int hidden, int inter);

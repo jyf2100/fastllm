@@ -7,6 +7,10 @@
 // https://github.com/ikawrakow/ik_llama.cpp
 
 #include <set>
+#include <map>
+#include <mutex>
+#include <vector>
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <thrust/device_vector.h>
@@ -3543,6 +3547,327 @@ static bool FastllmCudaTypedMergeMOEGGUFBatch1(const fastllm::Data &input, fastl
     FastllmCudaFree(q8W1);
     FastllmCudaFree(q8Input);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Batch1 device-indexed GGUF MoE: the router's expert ids stay on the GPU and
+// kernels pick each expert's weight base from a cached device pointer table,
+// so the per-layer D2H index sync never happens and the op stays CUDA-graph
+// safe. One launch covers all topk experts per phase instead of one per expert.
+// ---------------------------------------------------------------------------
+
+struct FastllmMoeGGUFExpertTable {
+    bool inited = false;
+    int experts = 0;
+    int hidden = 0;
+    int inter = 0;
+    // Gateup and down run in separate launches, so they may use different
+    // GGML types (e.g. Q4_K_M mixes Q4_K gateups with Q6_K downs); each role
+    // must merely be uniform across all experts of the layer.
+    ggml_type gateupType = GGML_TYPE_F32;
+    ggml_type downType = GGML_TYPE_F32;
+    const void **gateupPtrs = nullptr;
+    const void **downPtrs = nullptr;
+};
+
+static std::map<std::pair<int, const void*>, FastllmMoeGGUFExpertTable> fastllmMoeGGUFExpertTables;
+static std::mutex fastllmMoeGGUFExpertTablesMutex;
+
+static bool FastllmGetMoeGGUFExpertTable(fastllm::Data **weights, int weightsBatch, int hidden, int inter,
+                                         FastllmMoeGGUFExpertTable *&table) {
+    if (weights == nullptr || weightsBatch < 4 || (weightsBatch & 1)) {
+        return false;
+    }
+    int experts = weightsBatch / 2 - 1;
+    if (experts <= 0) {
+        return false;
+    }
+    fastllm::Data *firstGate = weights[2];
+    fastllm::Data *firstDown = weights[3];
+    if (firstGate == nullptr || firstDown == nullptr ||
+        firstGate->dataType != fastllm::DataType::DATA_GGUF_FORMAT ||
+        firstDown->dataType != fastllm::DataType::DATA_GGUF_FORMAT ||
+        firstGate->ggmlType < 0 || firstDown->ggmlType < 0) {
+        return false;
+    }
+    ggml_type gateupType = (ggml_type)firstGate->ggmlType;
+    ggml_type downType = (ggml_type)firstDown->ggmlType;
+    if (!get_has_vec_dot_q_cuda(gateupType) || !get_has_vec_dot_q_cuda(downType)) {
+        return false;
+    }
+
+    int deviceId = FastllmCudaGetDevice();
+    auto key = std::make_pair(deviceId, (const void*)weights[2]);
+    std::lock_guard<std::mutex> guard(fastllmMoeGGUFExpertTablesMutex);
+    FastllmMoeGGUFExpertTable &cached = fastllmMoeGGUFExpertTables[key];
+    if (cached.inited) {
+        if (cached.experts != experts || cached.hidden != hidden ||
+            cached.inter != inter || cached.gateupType != gateupType ||
+            cached.downType != downType) {
+            return false;
+        }
+        table = &cached;
+        return true;
+    }
+
+    std::vector<const void*> hGateupWeights(experts), hDownWeights(experts);
+    for (int e = 0; e < experts; e++) {
+        int idx = (e + 1) * 2;
+        // FastllmMoeGGUFCanRunWeight(weight, m, k) checks dims[0] == k, dims[1] == m;
+        // gateup: m = hidden (reduction), k = inter * 2 (rows); down: m = inter, k = hidden.
+        if (!FastllmMoeGGUFCanRunWeight(weights[idx], hidden, inter * 2) ||
+            !FastllmMoeGGUFCanRunWeight(weights[idx + 1], inter, hidden) ||
+            (int)weights[idx]->ggmlType != (int)gateupType ||
+            (int)weights[idx + 1]->ggmlType != (int)downType) {
+            return false;
+        }
+        hGateupWeights[e] = weights[idx]->cudaData;
+        hDownWeights[e] = weights[idx + 1]->cudaData;
+    }
+
+    size_t ptrBytes = (size_t)experts * sizeof(void*);
+    cached.gateupPtrs = (const void**)FastllmCudaMalloc(ptrBytes);
+    cached.downPtrs = (const void**)FastllmCudaMalloc(ptrBytes);
+
+    cudaError_t state = cudaMemcpyAsync(cached.gateupPtrs, hGateupWeights.data(), ptrBytes, cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when caching GGUF MoE gate pointer table!", state);
+    state = cudaMemcpyAsync(cached.downPtrs, hDownWeights.data(), ptrBytes, cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when caching GGUF MoE down pointer table!", state);
+
+    cached.inited = true;
+    cached.experts = experts;
+    cached.hidden = hidden;
+    cached.inter = inter;
+    cached.gateupType = gateupType;
+    cached.downType = downType;
+    table = &cached;
+    return true;
+}
+
+template <ggml_type type, int nwarps, typename T>
+static __global__ void FastllmMoeGGUFIndexedMatMulKernel(
+        const void * __restrict__ *weightPtrs, const int32_t * __restrict__ indices,
+        const block_q8_1 * __restrict__ q8Input, T * __restrict__ output,
+        int inputBlockStride, int outputRows, int inputSize) {
+    int j = blockIdx.y;
+    const char *cx = (const char *)weightPtrs[indices[j]];
+    const char *cy = (const char *)q8Input + (int64_t)j * inputBlockStride * sizeof(block_q8_1);
+    mul_mat_vec_q<type, 1, nwarps, T>(cx, cy, output + (int64_t)j * outputRows,
+                                      inputSize, outputRows, inputSize, outputRows);
+}
+
+template <typename T>
+static void FastllmMoeGGUFIndexedMatMul(ggml_type type, const void **weightPtrs, const int32_t *indices,
+                                        const block_q8_1 *q8Input, T *output,
+                                        int inputBlockStride, int outputRows, int inputSize, int topk) {
+    const dim3 grid(outputRows, topk);  // ncols_y == 1 -> rows_per_cuda_block == 1
+    const dim3 block(WARP_SIZE, 1);     // one warp per row: matches the batched-expert MMVQ guidance
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q2_K, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_Q3_K:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q3_K, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_IQ3_XXS, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_IQ3_S:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_IQ3_S, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_Q4_K:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q4_K, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_IQ4_NL, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_IQ4_XS, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_Q5_0:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q5_0, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_Q5_1:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q5_1, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_Q5_K:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q5_K, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_Q6_K:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q6_K, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        case GGML_TYPE_Q8_0:
+            FastllmMoeGGUFIndexedMatMulKernel<GGML_TYPE_Q8_0, 1, T><<<grid, block>>>(
+                weightPtrs, indices, q8Input, output, inputBlockStride, outputRows, inputSize);
+            break;
+        default:
+            printf("Error: unsupport cuda linear type %s\n", ggml_type_name(type));
+            exit(0);
+            break;
+    }
+}
+
+// Raw-pointer swiglu for the indexed path: same formula as FastllmSwigluKernel
+// (silu(x) * y), but operates on the stable scratch buffers so no per-call
+// Data allocation happens inside a CUDA graph capture.
+template <typename T>
+static __global__ void FastllmMoeGGUFIndexedSwigluKernel(const T * __restrict__ a, T * __restrict__ b,
+                                                         int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int id = idx / mid * spatial + idx % mid;
+        float x = FastllmMoeGGUFTraits<T>::toFloat(a[id]);
+        float y = FastllmMoeGGUFTraits<T>::toFloat(a[id + mid]);
+        b[idx] = FastllmMoeGGUFTraits<T>::fromFloat((x / (1.0f + expf(-x))) * y);
+    }
+}
+
+struct FastllmMoeGGUFBatch1IndexedScratch {
+    int topkCapacity = 0;
+    int hiddenCapacity = 0;
+    int interCapacity = 0;
+    block_q8_1 *q8Input = nullptr;  // 1 x hiddenCapacity
+    block_q8_1 *q8W1 = nullptr;     // topkCapacity x interCapacity
+    void *gateBuffer = nullptr;     // topkCapacity x interCapacity*2 activations
+    void *downBuffer = nullptr;     // topkCapacity x hiddenCapacity activations
+    size_t gateBytes = 0;
+    size_t downBytes = 0;
+};
+
+static std::map<int, FastllmMoeGGUFBatch1IndexedScratch> fastllmMoeGGUFBatch1IndexedScratch;
+static std::mutex fastllmMoeGGUFBatch1IndexedScratchMutex;
+
+static FastllmMoeGGUFBatch1IndexedScratch &FastllmGetMoeGGUFBatch1IndexedScratch(int topk, int hidden, int inter,
+                                                                                 size_t elementBytes) {
+    int deviceId = FastllmCudaGetDevice();
+    std::lock_guard<std::mutex> guard(fastllmMoeGGUFBatch1IndexedScratchMutex);
+    FastllmMoeGGUFBatch1IndexedScratch &scratch = fastllmMoeGGUFBatch1IndexedScratch[deviceId];
+    size_t wantGateBytes = (size_t)topk * inter * 2 * elementBytes;
+    size_t wantDownBytes = (size_t)topk * hidden * elementBytes;
+    if (topk > scratch.topkCapacity || hidden > scratch.hiddenCapacity || inter > scratch.interCapacity ||
+        wantGateBytes > scratch.gateBytes || wantDownBytes > scratch.downBytes) {
+        if (scratch.q8Input != nullptr) {
+            FastllmCudaFree(scratch.q8Input);
+        }
+        if (scratch.q8W1 != nullptr) {
+            FastllmCudaFree(scratch.q8W1);
+        }
+        if (scratch.gateBuffer != nullptr) {
+            FastllmCudaFree(scratch.gateBuffer);
+        }
+        if (scratch.downBuffer != nullptr) {
+            FastllmCudaFree(scratch.downBuffer);
+        }
+        scratch.topkCapacity = std::max(scratch.topkCapacity, topk);
+        scratch.hiddenCapacity = std::max(scratch.hiddenCapacity, hidden);
+        scratch.interCapacity = std::max(scratch.interCapacity, inter);
+        scratch.gateBytes = std::max(scratch.gateBytes, wantGateBytes);
+        scratch.downBytes = std::max(scratch.downBytes, wantDownBytes);
+        scratch.q8Input = (block_q8_1*)FastllmCudaMalloc(FastllmMoeGGUFQ8Bytes(1, scratch.hiddenCapacity));
+        scratch.q8W1 = (block_q8_1*)FastllmCudaMalloc(FastllmMoeGGUFQ8Bytes(scratch.topkCapacity, scratch.interCapacity));
+        scratch.gateBuffer = FastllmCudaMalloc(scratch.gateBytes);
+        scratch.downBuffer = FastllmCudaMalloc(scratch.downBytes);
+    }
+    return scratch;
+}
+
+template <typename T>
+static bool FastllmCudaTypedMergeMOEGGUFBatch1Indexed(const fastllm::Data &input, fastllm::Data &w1,
+                                                      fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+                                                      const int32_t *indices, const float *scores,
+                                                      int topk, int hidden, int inter) {
+    if (topk <= 0 || hidden <= 0 || inter <= 0 || indices == nullptr || scores == nullptr ||
+        input.dataType != FastllmMoeGGUFTraits<T>::dataType ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        hidden % QK8_1 != 0 || inter % QK8_1 != 0) {
+        return false;
+    }
+
+    FastllmMoeGGUFExpertTable *table = nullptr;
+    if (!FastllmGetMoeGGUFExpertTable(weights, weightsBatch, hidden, inter, table)) {
+        return false;
+    }
+    FastllmMoeGGUFBatch1IndexedScratch &scratch =
+        FastllmGetMoeGGUFBatch1IndexedScratch(topk, hidden, inter, sizeof(T));
+
+    // Only the caller-owned w1/output Data are (re)allocated here; the gate and
+    // down activations live in the stable per-device scratch so every pointer
+    // baked into a CUDA graph capture stays valid across replays.
+    w1.dataDevice = input.dataDevice;
+    w1.dataDeviceIds = input.dataDeviceIds;
+    w1.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    w1.Resize({topk, inter});
+    w1.Allocate(false);
+
+    output.dataDevice = input.dataDevice;
+    output.dataDeviceIds = input.dataDeviceIds;
+    output.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    output.Resize({1, hidden});
+    output.Allocate(false);
+
+    T *cudaInput = (T*)FastllmCudaPrepareInput(input);
+    T *cudaGate = (T*)scratch.gateBuffer;
+    T *cudaW1 = (T*)FastllmCudaPrepareOutput(w1);
+    T *cudaDown = (T*)scratch.downBuffer;
+    T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
+
+    quantize_row_q8_1_cuda(cudaInput, scratch.q8Input, hidden, 1, 1, hidden, GGML_TYPE_Q8_1, nullptr);
+    FastllmMoeGGUFIndexedMatMul<T>(table->gateupType, table->gateupPtrs, indices, scratch.q8Input, cudaGate,
+                                   0, inter * 2, hidden, topk);
+
+    {
+        int len = topk * inter;
+        int threadPerBlock = 256;
+        FastllmMoeGGUFIndexedSwigluKernel<T><<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            cudaGate, cudaW1, len, inter * 2, inter);
+    }
+
+    quantize_row_q8_1_cuda(cudaW1, scratch.q8W1, inter, topk, 1, inter, GGML_TYPE_Q8_1, nullptr);
+    FastllmMoeGGUFIndexedMatMul<T>(table->downType, table->downPtrs, indices, scratch.q8W1, cudaDown,
+                                   inter / QK8_1, hidden, inter, topk);
+
+    int threadPerBlock = 256;
+    FastllmMoeGGUFReduceKernel<T><<<(hidden - 1) / threadPerBlock + 1, threadPerBlock>>>(
+        cudaDown, cudaOutput, scores, topk, hidden);
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaFloatMergeMOEGGUFBatch1Indexed(const fastllm::Data &input, fastllm::Data &w1,
+                                               fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+                                               const int32_t *indices, const float *scores,
+                                               int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1Indexed<float>(
+        input, w1, output, weights, weightsBatch, indices, scores, topk, hidden, inter);
+}
+
+bool FastllmCudaHalfMergeMOEGGUFBatch1Indexed(const fastllm::Data &input, fastllm::Data &w1,
+                                              fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+                                              const int32_t *indices, const float *scores,
+                                              int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1Indexed<half>(
+        input, w1, output, weights, weightsBatch, indices, scores, topk, hidden, inter);
+}
+
+bool FastllmCudaBFloat16MergeMOEGGUFBatch1Indexed(const fastllm::Data &input, fastllm::Data &w1,
+                                                  fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+                                                  const int32_t *indices, const float *scores,
+                                                  int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1Indexed<__nv_bfloat16>(
+        input, w1, output, weights, weightsBatch, indices, scores, topk, hidden, inter);
 }
 
 bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
