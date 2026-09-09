@@ -12,6 +12,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <set>
+#include <memory>
 
 #ifdef PY_API
 #include "Python.h"
@@ -104,6 +105,16 @@ namespace fastllm {
 
         // 解锁
         void Unlock();
+    };
+
+    // 前缀 KV 冷备记录：请求结束/被驱逐时把整条分页链镜像到内存（RAM），
+    // 后续请求前缀在 GPU trie 中未命中时可物化回池，免去整段重算。
+    struct PagedPrefixColdRecord {
+        std::vector<int> tokens;              // 页对齐的前缀 token（记录键）
+        long long timestamp = 0;              // LRU 用
+        long long bytes = 0;
+        // 每个分页管理器序列化出的页内容，CPU Data，dims = [页数, pageLen, heads, dim]
+        std::map<PagedCacheManager*, Data> managerPages;
     };
 
     enum RoPEType { // 位置编码外推类型
@@ -441,6 +452,18 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+
+        // ---- 前缀 KV 冷备（RAM 镜像层）----
+        // 把 context 当前持有的整条分页 KV 链深拷贝到内存（页内容级，与 trie 状态无关）。
+        // 在请求结束（isEnding/isAbort）与 decode 页短缺驱逐（releaseAndReinitRequest）前调用。
+        void SavePagedPrefixToCold(ResponseContext *context);
+        // 返回 tokens 在冷备中可命中的最长页数（要求严格大于 minPages 才有意义），0 表示无可用记录。
+        int QueryPagedPrefixColdPages(const std::vector<int> &tokens, int minPages) const;
+        // 把冷备记录的前 prefixPages 页拷回各分页池并 Record 进 trie，供通用恢复路径接手。
+        bool MaterializePagedPrefixCold(const std::vector<int> &tokens, int prefixPages);
+
+        mutable std::mutex pagedPrefixColdLocker;
+        std::vector<std::unique_ptr<PagedPrefixColdRecord>> pagedPrefixColdRecords;
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 

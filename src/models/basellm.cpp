@@ -584,7 +584,303 @@ namespace fastllm {
         responseContextDict.RemoveHandle(handleId);
     }
 
+    // ---------------- 前缀 KV 冷备（RAM 镜像层） ----------------
+    // 请求结束/被驱逐时把整条分页 KV 链的页内容镜像到内存；后续请求前缀在 GPU
+    // trie 中未命中时，把镜像物化回分页池并 Record 进 trie，交给通用恢复路径，
+    // 免去整段重算。GPU 页生命周期完全不变（空闲 trie 页今天就是可偷的），
+    // 本层只保证"内容可复原"。开关：FASTLLM_PREFIX_CACHE_COLD_GB（默认 0 = 关）。
+
+    static double PagedPrefixColdMaxGB() {
+        const char *env = std::getenv("FASTLLM_PREFIX_CACHE_COLD_GB");
+        return (env == nullptr || env[0] == 0) ? 0.0 : atof(env);
+    }
+
+    static int PagedPrefixColdMaxRecords() {
+        const char *env = std::getenv("FASTLLM_PREFIX_CACHE_COLD_MAX_RECORDS");
+        return (env == nullptr || env[0] == 0) ? 32 : std::max(1, atoi(env));
+    }
+
+    static int PagedPrefixColdMinPages() {
+        const char *env = std::getenv("FASTLLM_PREFIX_CACHE_COLD_MIN_PAGES");
+        return (env == nullptr || env[0] == 0) ? 16 : std::max(1, atoi(env));
+    }
+
+    static long long PagedPrefixColdNowTs() {
+        return std::chrono::steady_clock::now().time_since_epoch().count();
+    }
+
+    void basellm::SavePagedPrefixToCold(ResponseContext *context) {
+        if (context == nullptr || PagedPrefixColdMaxGB() <= 0.0) {
+            return;
+        }
+        // 收集各层 K/V 分页描述符。跳过 bounded-tail 层与线性注意力 slot 视图，
+        // 与通用 trie Record 的取舍一致：只有完整前缀链可以镜像。
+        std::vector<std::pair<Data *, PagedCacheManager *> > targets;
+        std::function<void(Data &)> collect = [&](Data &cache) {
+            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr) {
+                        collect(*it.second);
+                    }
+                }
+                return;
+            }
+            if (cache.isLinearAttention || !cache.isPagedKVCache ||
+                cache.pagedKVCacheData == nullptr || cache.pageIndex.empty() ||
+                cache.pagedKVCacheData->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                return;
+            }
+            targets.push_back(std::make_pair(&cache, cache.pagedKVCacheData));
+        };
+        for (int i = 0; i < (int)context->pastKeyValues.size(); i++) {
+            if (this->GetKVCacheRetainedTokens(i) >= 0) {
+                continue;
+            }
+            collect(context->pastKeyValues[i].first);
+            collect(context->pastKeyValues[i].second);
+        }
+        if (targets.empty()) {
+            return;
+        }
+
+        int pageLen = targets[0].first->pageLen;
+        int numPages = (int)context->allTokens.size() / pageLen;
+        for (auto &t : targets) {
+            if (t.first->pageLen != pageLen) {
+                return; // 页长不一致，无法一致镜像
+            }
+            int fullPages = (int)t.first->pageIndex.size();
+            if (t.first->lastPageLen < pageLen) {
+                fullPages--;
+            }
+            numPages = std::min(numPages, fullPages);
+        }
+        if (numPages < PagedPrefixColdMinPages()) {
+            return;
+        }
+
+        auto record = std::make_unique<PagedPrefixColdRecord>();
+        record->timestamp = PagedPrefixColdNowTs();
+        record->tokens.assign(context->allTokens.begin(),
+                              context->allTokens.begin() + numPages * pageLen);
+        for (auto &t : targets) {
+            Data *managerData = (Data *)t.second;
+            if (managerData->dims.size() < 4 || managerData->unitSize <= 0) {
+                return;
+            }
+            long long rowElems = (long long)managerData->dims[1] *
+                    managerData->dims[2] * managerData->dims[3];
+            long long rowBytes = rowElems * managerData->unitSize / managerData->unitSizeDiv;
+            auto inserted = record->managerPages.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(t.second),
+                    std::forward_as_tuple(managerData->dataType,
+                        std::vector<int>{numPages, managerData->dims[1],
+                                         managerData->dims[2], managerData->dims[3]}));
+            Data &blob = inserted.first->second;
+            blob.Allocate(); // Resize 只设形状不分配，CPU 内存在此申请
+            bool ok = true;
+            for (int p = 0; p < numPages && ok; p++) {
+                int pageId = t.first->pageIndex[p];
+                void *dst = (uint8_t *)blob.cpuData + (size_t)p * rowBytes;
+#ifdef USE_CUDA
+                if (managerData->dataDevice == DataDevice::CUDA &&
+                    managerData->cudaData != nullptr) {
+                    FastllmCudaCopyFromDeviceToHost(
+                            dst,
+                            (uint8_t *)managerData->cudaData + (size_t)pageId * rowBytes,
+                            rowBytes);
+                    continue;
+                }
+#endif
+                if (managerData->cpuData != nullptr) {
+                    memcpy(dst,
+                           (uint8_t *)managerData->cpuData + (size_t)pageId * rowBytes,
+                           rowBytes);
+                } else {
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                return;
+            }
+            record->bytes += rowBytes * numPages;
+        }
+
+        int savedPages = numPages;
+        long long savedBytes = record->bytes;
+        std::lock_guard<std::mutex> guard(this->pagedPrefixColdLocker);
+        long long budgetBytes = (long long)(PagedPrefixColdMaxGB() * 1e9);
+        auto isPrefixOf = [](const std::vector<int> &shorter, const std::vector<int> &longer) {
+            return shorter.size() <= longer.size() &&
+                   std::equal(shorter.begin(), shorter.end(), longer.begin());
+        };
+        std::vector<std::unique_ptr<PagedPrefixColdRecord>> kept;
+        kept.reserve(this->pagedPrefixColdRecords.size() + 1);
+        long long totalBytes = savedBytes;
+        for (auto &r : this->pagedPrefixColdRecords) {
+            if (isPrefixOf(r->tokens, record->tokens)) {
+                continue; // 同对话更早的短前缀被本次记录取代
+            }
+            totalBytes += r->bytes;
+            kept.push_back(std::move(r));
+        }
+        kept.push_back(std::move(record));
+        if (totalBytes > budgetBytes || (int)kept.size() > PagedPrefixColdMaxRecords()) {
+            std::sort(kept.begin(), kept.end(),
+                      [](const std::unique_ptr<PagedPrefixColdRecord> &a,
+                         const std::unique_ptr<PagedPrefixColdRecord> &b) {
+                          return a->timestamp < b->timestamp;
+                      });
+            while (kept.size() > 1 &&
+                   (totalBytes > budgetBytes ||
+                    (int)kept.size() > PagedPrefixColdMaxRecords())) {
+                totalBytes -= kept.front()->bytes;
+                kept.erase(kept.begin());
+            }
+        }
+        this->pagedPrefixColdRecords = std::move(kept);
+        printf("[ColdKV] save prefix: %d pages (%d tokens, %.1f MB), records=%zu\n",
+               savedPages, savedPages * pageLen, savedBytes / 1e6,
+               this->pagedPrefixColdRecords.size());
+        fflush(stdout);
+    }
+
+    int basellm::QueryPagedPrefixColdPages(const std::vector<int> &tokens, int minPages) const {
+        if (PagedPrefixColdMaxGB() <= 0.0) {
+            return 0;
+        }
+        int pageLen = fastllm::GetPageLen();
+        if (pageLen <= 0) {
+            return 0;
+        }
+        int maxPages = (int)tokens.size() / pageLen;
+        std::lock_guard<std::mutex> guard(this->pagedPrefixColdLocker);
+        int best = 0;
+        for (auto &r : this->pagedPrefixColdRecords) {
+            int cand = std::min((int)r->tokens.size() / pageLen, maxPages);
+            if (cand <= minPages || cand <= best) {
+                continue;
+            }
+            // 逐页求最长公共前缀：请求可能在记录中段分叉（如客户端重拼的 assistant 回合），
+            // 整条 memcmp 会把可用的长前缀一起丢掉
+            int match = 0;
+            while (match < cand &&
+                   memcmp(r->tokens.data() + (size_t)match * pageLen,
+                          tokens.data() + (size_t)match * pageLen,
+                          (size_t)pageLen * sizeof(int)) == 0) {
+                match++;
+            }
+            if (match > best) {
+                best = match;
+            }
+        }
+        return best;
+    }
+
+    bool basellm::MaterializePagedPrefixCold(const std::vector<int> &tokens, int prefixPages) {
+        if (PagedPrefixColdMaxGB() <= 0.0 || prefixPages <= 0) {
+            return false;
+        }
+        int pageLen = fastllm::GetPageLen();
+        if (pageLen <= 0 || (int)tokens.size() < prefixPages * pageLen) {
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(this->pagedPrefixColdLocker);
+        PagedPrefixColdRecord *best = nullptr;
+        int bestLcp = 0;
+        for (auto &r : this->pagedPrefixColdRecords) {
+            int cand = std::min((int)r->tokens.size() / pageLen, prefixPages);
+            if (cand <= bestLcp) {
+                continue;
+            }
+            int match = 0;
+            while (match < cand &&
+                   memcmp(r->tokens.data() + (size_t)match * pageLen,
+                          tokens.data() + (size_t)match * pageLen,
+                          (size_t)pageLen * sizeof(int)) == 0) {
+                match++;
+            }
+            if (match > bestLcp) {
+                bestLcp = match;
+                best = r.get();
+            }
+        }
+        if (best == nullptr || bestLcp < PagedPrefixColdMinPages()) {
+            return false;
+        }
+        prefixPages = bestLcp;
+        // 容量夹取：每池至少留 1 页余量，避免把空闲页吃干导致 GetUnusedPageIndex 兜底报错
+        int pages = prefixPages;
+        for (auto &it : best->managerPages) {
+            Data *managerData = (Data *)it.first;
+            int freePages;
+            {
+                std::lock_guard<std::mutex> g(it.first->pageIndexLocker);
+                freePages = it.first->FreePageCount();
+            }
+            (void)managerData;
+            pages = std::min(pages, freePages - 1);
+        }
+        if (pages < PagedPrefixColdMinPages()) {
+            return false;
+        }
+        auto startTime = std::chrono::steady_clock::now();
+        for (auto &it : best->managerPages) {
+            PagedCacheManager *manager = it.first;
+            Data &blob = it.second;
+            Data *managerData = (Data *)manager;
+            if (blob.dims.size() < 4 || blob.dims[0] < pages ||
+                managerData->dims.size() < 4 || managerData->unitSize <= 0) {
+                return false;
+            }
+            long long rowElems = (long long)managerData->dims[1] *
+                    managerData->dims[2] * managerData->dims[3];
+            long long rowBytes = rowElems * managerData->unitSize / managerData->unitSizeDiv;
+            std::vector<int> newIds;
+            newIds.reserve(pages);
+            for (int p = 0; p < pages; p++) {
+                newIds.push_back(manager->GetUnusedPageIndex(true));
+            }
+            bool ok = true;
+            for (int p = 0; p < pages && ok; p++) {
+                void *src = (uint8_t *)blob.cpuData + (size_t)p * rowBytes;
+                void *dst;
+#ifdef USE_CUDA
+                if (managerData->dataDevice == DataDevice::CUDA &&
+                    managerData->cudaData != nullptr) {
+                    dst = (uint8_t *)managerData->cudaData + (size_t)newIds[p] * rowBytes;
+                    FastllmCudaCopyFromHostToDevice(dst, src, rowBytes);
+                    continue;
+                }
+#endif
+                if (managerData->cpuData != nullptr) {
+                    dst = (uint8_t *)managerData->cpuData + (size_t)newIds[p] * rowBytes;
+                    memcpy(dst, src, rowBytes);
+                } else {
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                return false;
+            }
+            std::vector<int> recTokens(tokens.begin(), tokens.begin() + pages * pageLen);
+            manager->Record(recTokens, newIds);
+        }
+        best->timestamp = PagedPrefixColdNowTs();
+        float elapsedMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - startTime).count();
+        printf("[ColdKV] restore prefix: %d pages (%d tokens), %.1f ms\n",
+               pages, pages * pageLen, elapsedMs);
+        fflush(stdout);
+        return true;
+    }
+
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        // 结束/中止的请求先把整条分页 KV 链镜像进 RAM 冷备（页内容即将随页释放而不保真）
+        if (model != nullptr && (this->isEnding || this->isAbort)) {
+            model->SavePagedPrefixToCold(this);
+        }
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1340,6 +1636,8 @@ namespace fastllm {
 
         // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
         auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
+            // 驱逐重算前先镜像：该请求重新 prefill 接纳时可从 RAM 冷备物化，免整段重算
+            model->SavePagedPrefixToCold(ctx);
             for (int i = 0; i < model->block_cnt; i++) {
                 auto &kvFirst = ctx->pastKeyValues[i].first;
                 auto &kvSecond = ctx->pastKeyValues[i].second;
@@ -1891,6 +2189,17 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
+                        if (!model->pagedPrefixColdRecords.empty() &&
+                            !(ctx->cacheLen == 0 &&
+                              ctx->intParams.find("paged_prefix_restore_disabled") ==
+                                  ctx->intParams.end())) {
+                            // 诊断：冷备非空但本接纳未走前缀恢复分支，说明 cacheLen!=0 或已被禁用
+                            printf("[ColdKV] skip: prompt=%zu cacheLen=%d disabled=%d\n",
+                                   ctx->currentTokens.size(), ctx->cacheLen,
+                                   (int)(ctx->intParams.find("paged_prefix_restore_disabled") !=
+                                         ctx->intParams.end()));
+                            fflush(stdout);
+                        }
                         if (ctx->cacheLen == 0 &&
                             ctx->intParams.find("paged_prefix_restore_disabled") ==
                                 ctx->intParams.end()) {
@@ -1930,6 +2239,24 @@ namespace fastllm {
                                     }
                                     return it->second;
                                 };
+
+                                // RAM 冷备：GPU trie 命中不足时，把更长前缀物化回池并 Record 进 trie，
+                                // 下面的通用查询/恢复路径随即可见（页由 GetUnusedPageIndex 认领，可能逐出其他 trie 前缀）
+                                {
+                                    int trieHitPages = (int)queryManager(probeManager).size();
+                                    int coldPages = model->QueryPagedPrefixColdPages(
+                                            ctx->currentTokens, trieHitPages);
+                                    if (!model->pagedPrefixColdRecords.empty()) {
+                                        printf("[ColdKV] probe: prompt=%zu trie=%d cold=%d records=%zu\n",
+                                               ctx->currentTokens.size(), trieHitPages, coldPages,
+                                               model->pagedPrefixColdRecords.size());
+                                        fflush(stdout);
+                                    }
+                                    if (coldPages > trieHitPages &&
+                                        model->MaterializePagedPrefixCold(ctx->currentTokens, coldPages)) {
+                                        queriedPages.clear();
+                                    }
+                                }
 
                                 int minCachedPages = (int)queryManager(probeManager).size();
                                 if (minCachedPages > 0) {
