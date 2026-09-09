@@ -3929,7 +3929,12 @@ namespace fastllm {
     }
 
     void basellm::SetKVCacheDataType(DataType dataType) {
-        if (dataType == DataType::FP4_E2M1 && this->model_type != "qwen3_5") {
+        // qwen3_5 / qwen3_5_moe / qwen3_5_moe_text 实例化的是同一个 Qwen3_5Model，
+        // 走同一条 CUDA 分页注意力路径，fp4 KV 对整个 Qwen3.5 家族可用
+        if (dataType == DataType::FP4_E2M1 &&
+            this->model_type != "qwen3_5" &&
+            this->model_type != "qwen3_5_moe" &&
+            this->model_type != "qwen3_5_moe_text") {
             ErrorInFastLLM("FP4 KV cache currently supports the Qwen3.5 CUDA paged attention path only.");
         }
 #ifndef USE_CUDA
