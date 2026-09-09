@@ -8579,6 +8579,23 @@ namespace fastllm {
         return preferredType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
     }
 
+    // 构造分页池分配描述：形状/设备跟 src，dtype 覆盖为池类型（kvCacheDataType）。
+    // 与 GPU forward 路径的 makeCacheDesc（见 ForwardV2）同源。
+    static Data Qwen35MakePagedCacheDesc(const Data &src, DataType targetType) {
+        Data desc(targetType);
+        desc.dims = src.dims;
+        desc.strides = src.strides;
+        desc.dataDevice = src.dataDevice;
+        desc.dataDeviceIds = src.dataDeviceIds;
+        desc.multiDeviceData = src.multiDeviceData;
+        desc.tpLayout = src.tpLayout;
+        desc.tpAxis = src.tpAxis;
+        desc.tpGlobalDims = src.tpGlobalDims;
+        desc.tpRanges = src.tpRanges;
+        desc.UpdateUnitSize();
+        return desc;
+    }
+
     static void PreparePagedAttentionInputs(Data &q, Data &k, Data &v, DataType preferredType) {
 #ifdef USE_CUDA
         if (q.dataDevice != DataDevice::CUDA) {
@@ -34565,10 +34582,24 @@ namespace fastllm {
                 v.Reshape(qkvSize);
                 PreparePagedAttentionInputs(q, k, v, this->dataType);
 
+                // 分页池必须与 GPU forward 路径共用同一套 manager：
+                // 1) 层键优先落在 threadTpPagedCacheBase 命名空间（与 GetPagedKVCacheManager
+                //    的解析一致），否则 decode 走 GPU 路径读不到这里写入的 KV；
+                //    base 未启用/无池时退回 0 基址键（basellm 回退同款）。
+                // 2) 池 dtype 用 pastKey 包装器的 kvCacheDataType（如 fp4），
+                //    不能把 fp16 的 k/v 直接当池描述——否则按 fp16 重复分配整套池
+                //    （20×134MB）且与既有 fp4 池互不相通。
+                int mmCacheLayerIdx = i;
+                if (this->threadTpPagedCacheBase >= 0 &&
+                    GetPagedCacheManager((this->threadTpPagedCacheBase + i) * 2) != nullptr) {
+                    mmCacheLayerIdx += this->threadTpPagedCacheBase;
+                }
+                Data kCacheDesc = Qwen35MakePagedCacheDesc(k, pastKey.dataType);
+                Data vCacheDesc = Qwen35MakePagedCacheDesc(v, pastValue.dataType);
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                    mmCacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                    mmCacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                 AppendPagedCache(*pagedCacheKManager, pastKey, k);
                 AppendPagedCache(*pagedCacheVManager, pastValue, v);
                 AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
@@ -35352,7 +35383,7 @@ namespace fastllm {
                 adjustedPositionIds.CopyFrom(positionIds);
             }
 #ifdef USE_CUDA
-            if (context != nullptr && CanUseGPUForward()) {
+            if (CanUseGPUForward()) {
                 std::vector<Data*> attentionMasks = {
                     attentionMask.dims.empty() ? nullptr :
                                                 const_cast<Data*>(&attentionMask)
@@ -35368,13 +35399,22 @@ namespace fastllm {
                 std::vector<GenerationConfig> generationConfigs = {
                     generationConfig
                 };
-                usedMtpForward = Qwen35MTPForward(
-                    true, context, inputIds, attentionMasks, positionIdVec,
-                    seqLens, pagedPastKeyValues, generationConfigs,
-                    acceptedTokens, nextInputTokens, keptInputLens);
-                if (usedMtpForward) {
-                    return {};
+                if (context != nullptr) {
+                    usedMtpForward = Qwen35MTPForward(
+                        true, context, inputIds, attentionMasks, positionIdVec,
+                        seqLens, pagedPastKeyValues, generationConfigs,
+                        acceptedTokens, nextInputTokens, keptInputLens);
+                    if (usedMtpForward) {
+                        return {};
+                    }
                 }
+                // 续算/分块 chunk 走 GPU runner（与文本路径同源，复用 base 命名空间
+                // 的分页池与 graph）。落回老式 Forward 会进 ForwardV2 的 op 路径，
+                // 用 0 基址键另建整套池：既 OOM，prefill 写入的 KV 也读不到。
+                // 注意 RunNewMainLoop 的包装层传 context=nullptr，不能以 context
+                // 作为走 GPU 的门槛（MTP 才需要 context）。
+                return ForwardGPU(1, inputIds, attentionMasks, positionIdVec, seqLens,
+                                  pagedPastKeyValues, generationConfigs, lastTokens, retLogits);
             }
 #endif
             ret.push_back(Forward(inputIds, attentionMask, adjustedPositionIds, pastKeyValues, generationConfig, lastTokens, logits));
