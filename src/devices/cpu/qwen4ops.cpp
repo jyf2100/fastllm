@@ -128,10 +128,22 @@ namespace fastllm {
 
         void Qwen4AssertCpuTensor(const Data &data,
                                   const std::string &name) {
-            AssertInFastLLM(data.dataDevice == DataDevice::CPU &&
-                            data.cpuData != nullptr &&
-                            Qwen4ActivationType(data.dataType),
-                            name + " must be a CPU float32/float16/bfloat16 tensor.\n");
+            if (data.dataDevice == DataDevice::CPU &&
+                data.cpuData != nullptr &&
+                Qwen4ActivationType(data.dataType)) {
+                return;
+            }
+            std::string details = name +
+                " must be a CPU float32/float16/bfloat16 tensor, but got " +
+                "device=" + std::to_string((int)data.dataDevice) +
+                ", cpuData=" + (data.cpuData == nullptr ? "null" : "set") +
+                ", dtype=" + std::to_string((int)data.dataType) +
+                ", dims=[";
+            for (int d : data.dims) {
+                details += std::to_string(d) + ",";
+            }
+            details += "].\n";
+            ErrorInFastLLM(details);
         }
     }
 

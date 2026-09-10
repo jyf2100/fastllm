@@ -16,6 +16,7 @@
 #include "json11.hpp"
 #include "utils.h"
 #include "utils/persistent_worker_group.h"
+#include "gguf.h"
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -1119,7 +1120,9 @@ namespace fastllm {
         }
 
         void Qwen4AddOne(Data &data) {
-            if (data.dims.empty()) {
+            // GGUF converters materialize the effective norm scale already;
+            // applying the checkpoint's +1 offset again would corrupt it.
+            if (data.dims.empty() || data.isGGUFData) {
                 return;
             }
             data.ToDevice(DataDevice::CPU);
@@ -2391,6 +2394,17 @@ namespace fastllm {
                 WeightMergeRuleSingle({sharedGate, sharedUp}, sharedGateUp,
                                       std::string("linearSwiglu"))}));
 
+            // GGUF checkpoints split the indexer projection into q/k halves;
+            // the merge machinery concatenates them into the fused [q; k]
+            // tensor the forward pass consumes.  Rules on GDN layers without
+            // an indexer never fire (inputs[0] absent) and are skipped.
+            const std::string indexerPrefix = languagePrefix + "layers." +
+                std::to_string(layer) +
+                ".self_attn.indexer.index_qk_proj.weight";
+            this->weightMergeRules.push_back(WeightMergeRule({
+                WeightMergeRuleSingle({indexerPrefix + "__0", indexerPrefix + "__1"},
+                                      indexerPrefix, std::string("linear"))}));
+
             for (int expert = 0; expert < this->num_experts; expert++) {
                 const std::string expertPrefix = mlp + "experts." +
                                                  std::to_string(expert) + ".";
@@ -2618,7 +2632,148 @@ namespace fastllm {
         this->weight.weight.erase(kMtpPackedDownName);
     }
 
+    // llama.cpp writes GDN value-head rows tiled per key-head group while the
+    // HF checkpoint (and the kernels above) expect contiguous rows.  The
+    // restore is a pure row reorder, so it works on real FP32 tensors and on
+    // block-quantized GGUF storage alike (rows are byte-aligned).
+    static void Qwen4RestoreGgufTiledHeadRows(
+            Data &data, int rowOffset, int valueHeads, int rowsPerHead,
+            int keyHeads, const std::string &weightName) {
+        AssertInFastLLM(
+            data.dataDevice == DataDevice::CPU && data.cpuData != nullptr,
+            "Qwen4-Exp GGUF GDN layout restore requires a resident CPU weight: " +
+                weightName + ".\n");
+        AssertInFastLLM(
+            !data.dims.empty() && data.dims[0] > 0 && keyHeads > 0 &&
+                valueHeads > 0 && valueHeads % keyHeads == 0 &&
+                rowsPerHead > 0 && rowOffset >= 0 &&
+                rowOffset + valueHeads * rowsPerHead <= data.dims[0],
+            "Qwen4-Exp GGUF GDN weight has an invalid head layout: " +
+                weightName + ".\n");
+        const size_t totalBytes = data.GetBytes();
+        const size_t rows = (size_t)data.dims[0];
+        AssertInFastLLM(
+            totalBytes % rows == 0,
+            "Qwen4-Exp GGUF GDN weight has non-row-aligned storage: " +
+                weightName + ".\n");
+        const size_t rowBytes = totalBytes / rows;
+        const size_t headBytes = rowBytes * (size_t)rowsPerHead;
+        std::vector<uint8_t> reordered((size_t)valueHeads * headBytes);
+        const int valuesPerKey = valueHeads / keyHeads;
+        const uint8_t *source = data.cpuData + (size_t)rowOffset * rowBytes;
+        for (int groupedHead = 0; groupedHead < valueHeads; groupedHead++) {
+            const int keyHead = groupedHead / valuesPerKey;
+            const int valueInGroup = groupedHead % valuesPerKey;
+            const int tiledHead = valueInGroup * keyHeads + keyHead;
+            memcpy(reordered.data() + (size_t)groupedHead * headBytes,
+                   source + (size_t)tiledHead * headBytes, headBytes);
+        }
+        memcpy(data.cpuData + (size_t)rowOffset * rowBytes,
+               reordered.data(), reordered.size());
+    }
+
+    static void Qwen4RestoreGgufSsmA(Data &data,
+                                     const std::string &weightName) {
+        AssertInFastLLM(
+            data.dataDevice == DataDevice::CPU && data.cpuData != nullptr &&
+                data.dataType == DataType::FLOAT32,
+            "Qwen4-Exp GGUF ssm_a must be a resident FP32 tensor: " +
+                weightName + ".\n");
+        float *values = (float *)data.cpuData;
+        for (uint64_t i = 0; i < data.Count(0); i++) {
+            AssertInFastLLM(
+                std::isfinite(values[i]) && values[i] < 0.0f,
+                "Qwen4-Exp GGUF ssm_a contains an invalid decay value: " +
+                    weightName + ".\n");
+            // GGUF stores the effective decay -exp(A_log), whereas the
+            // recurrent kernels apply -exp() themselves.
+            values[i] = std::log(-values[i]);
+        }
+    }
+
+    void Qwen4ExpModel::RestoreGgufGdnWeights() {
+        if (this->ggufGdnLayoutRestored) {
+            return;
+        }
+        const int kd = this->num_k_heads * this->head_k_dim;
+        const int vd = this->num_v_heads * this->head_v_dim;
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            const std::string prefix = languagePrefix + "layers." +
+                std::to_string(layer) + ".linear_attn.";
+            auto outIt = this->weight.weight.find(prefix + "out_proj.weight");
+            if (outIt == this->weight.weight.end() ||
+                !outIt->second.isGGUFData) {
+                continue;
+            }
+            auto requireWeight = [&](const std::string &name) -> Data & {
+                auto it = this->weight.weight.find(name);
+                AssertInFastLLM(
+                    it != this->weight.weight.end(),
+                    "Qwen4-Exp GGUF GDN is missing weight " + name + ".\n");
+                return it->second;
+            };
+            auto requireRows = [&](Data &data, int expectedRows,
+                                   const std::string &name) {
+                AssertInFastLLM(
+                    !data.dims.empty() && data.dims[0] == expectedRows,
+                    "Qwen4-Exp GGUF GDN weight has an unexpected shape: " +
+                        name + ".\n");
+            };
+
+            Data &qkv = requireWeight(prefix + "in_proj_qkv.weight");
+            requireRows(qkv, kd * 2 + vd, prefix + "in_proj_qkv.weight");
+            Qwen4RestoreGgufTiledHeadRows(
+                qkv, kd * 2, this->num_v_heads, this->head_v_dim,
+                this->num_k_heads, prefix + "in_proj_qkv.weight");
+            Data &z = requireWeight(prefix + "in_proj_z.weight");
+            requireRows(z, vd, prefix + "in_proj_z.weight");
+            Qwen4RestoreGgufTiledHeadRows(
+                z, 0, this->num_v_heads, this->head_v_dim,
+                this->num_k_heads, prefix + "in_proj_z.weight");
+            Data &b = requireWeight(prefix + "in_proj_b.weight");
+            requireRows(b, this->num_v_heads, prefix + "in_proj_b.weight");
+            Qwen4RestoreGgufTiledHeadRows(
+                b, 0, this->num_v_heads, 1, this->num_k_heads,
+                prefix + "in_proj_b.weight");
+            Data &a = requireWeight(prefix + "in_proj_a.weight");
+            requireRows(a, this->num_v_heads, prefix + "in_proj_a.weight");
+            Qwen4RestoreGgufTiledHeadRows(
+                a, 0, this->num_v_heads, 1, this->num_k_heads,
+                prefix + "in_proj_a.weight");
+            Data &conv = requireWeight(prefix + "conv1d.weight");
+            requireRows(conv, kd * 2 + vd, prefix + "conv1d.weight");
+            Qwen4RestoreGgufTiledHeadRows(
+                conv, kd * 2, this->num_v_heads, this->head_v_dim,
+                this->num_k_heads, prefix + "conv1d.weight");
+            Data &aLog = requireWeight(prefix + "A_log");
+            requireRows(aLog, this->num_v_heads, prefix + "A_log");
+            Qwen4RestoreGgufTiledHeadRows(
+                aLog, 0, this->num_v_heads, 1, this->num_k_heads,
+                prefix + "A_log");
+            Qwen4RestoreGgufSsmA(aLog, prefix + "A_log");
+            Data &dtBias = requireWeight(prefix + "dt_bias");
+            requireRows(dtBias, this->num_v_heads, prefix + "dt_bias");
+            Qwen4RestoreGgufTiledHeadRows(
+                dtBias, 0, this->num_v_heads, 1, this->num_k_heads,
+                prefix + "dt_bias");
+        }
+        this->ggufGdnLayoutRestored = true;
+    }
+
     void Qwen4ExpModel::OnModelWeightsLoaded() {
+        RestoreGgufGdnWeights();
+        // llama.cpp squeezes PLE's rank-3 [channels, 1, kernel] convolution
+        // weight into the rank-2 [channels, kernel] GGUF layout.  The byte
+        // order is identical, so restoring the rank is metadata-only.
+        Data &pleConvWeight = this->weight[languagePrefix + "layers." +
+            std::to_string(this->pleLayer) + ".ple.conv1d.weight"];
+        if (pleConvWeight.isGGUFData &&
+            pleConvWeight.dims.size() == 2 &&
+            pleConvWeight.dims[0] == this->hcCount * this->embed_dim &&
+            pleConvWeight.dims[1] == this->pleConvKernel) {
+            pleConvWeight.Reshape(
+                {pleConvWeight.dims[0], 1, pleConvWeight.dims[1]});
+        }
         if (this->ngramDevice != "disk") {
             if (MoeCudaCacheRequested()) {
                 PrepareWeights();
@@ -2692,6 +2847,13 @@ namespace fastllm {
     bool Qwen4ExpModel::IsLinearAttentionLayer(int layer) const {
         return layer >= 0 && layer < (int)this->linearLayers.size() &&
                this->linearLayers[layer];
+    }
+
+    bool Qwen4ExpModel::IsHostOnlyWeight(const std::string &weightName) const {
+        // The PLE ngram table (GGUF packs it as shard_0 under this prefix)
+        // follows --ngram_device and never migrates to the device map.
+        return weightName.find(".ple.ple_embedding.ngram_embedding.") !=
+               std::string::npos;
     }
 
     bool Qwen4ExpModel::HasMtpWeights() const {
@@ -3107,8 +3269,12 @@ namespace fastllm {
         Data &firstShard = this->weight[embeddingPrefix + "shard_0.weight"];
         const bool fp8Embedding = firstShard.dataType == DataType::FP8_E4M3;
         const bool bf16Embedding = firstShard.dataType == DataType::BFLOAT16;
+        // GGUF checkpoints pack the whole ngram table into one GGML-typed
+        // tensor aliased as shard_0 (its row space equals the HF shards
+        // concatenated in order), so every lookup lands in shard 0.
+        const bool ggufEmbedding = firstShard.dataType == DataType::DATA_GGUF_FORMAT;
         const bool diskEmbedding = firstShard.isDiskWeight;
-        AssertInFastLLM((fp8Embedding || bf16Embedding) &&
+        AssertInFastLLM((fp8Embedding || bf16Embedding || ggufEmbedding) &&
                         firstShard.dims.size() == 2 &&
                         firstShard.dims[1] == this->ngramHeadDim,
                         "Qwen4-Exp PLE shard has an unexpected dtype or shape.");
@@ -3193,6 +3359,18 @@ namespace fastllm {
                             destination[column] =
                                 fp8Decoder.dict[source[column]] * embeddingScale;
                         }
+                    } else if (ggufEmbedding) {
+                        // GGML rows are block-quantized; ngramHeadDim is a
+                        // multiple of the 32-element block size, so decode a
+                        // whole row straight from its byte offset.
+                        const ggml_type type = (ggml_type)shard.ggmlType;
+                        auto toFloat = ggml_type_to_float(type);
+                        AssertInFastLLM(toFloat != nullptr,
+                                        "Qwen4-Exp GGUF PLE type cannot be dequantized.");
+                        const size_t rowBytes =
+                            ggml_row_size(type, this->ngramHeadDim);
+                        toFloat(shard.cpuData + (size_t)shardRow * rowBytes,
+                                destination, this->ngramHeadDim);
                     } else {
                         const uint16_t *source =
                             reinterpret_cast<const uint16_t *>(shard.cpuData) +
@@ -5441,6 +5619,12 @@ namespace fastllm {
         query.Reshape({-1, sequence, this->head_dim});
         key.Reshape({-1, sequence, this->head_dim});
         value.Reshape({-1, sequence, this->head_dim});
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(stateLayer) + "_qcur", query);
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(stateLayer) + "_kcur", key);
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(stateLayer) + "_vcur", value);
 
         if (GetKVCacheInCPU()) {
             pastKey.lockInCPU = true;
@@ -5498,6 +5682,10 @@ namespace fastllm {
             CatDirect(pastKey, key, 1);
             CatDirect(pastValue, value, 1);
         }
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(stateLayer) + "_pastkey", pastKey);
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(stateLayer) + "_pastvalue", pastValue);
         if (sequence == 1) {
             state.geometricCacheGrowthReadyLayers.insert(stateLayer);
         }
@@ -5517,6 +5705,8 @@ namespace fastllm {
         PermuteSelf(context, {1, 0, 2});
         context.Reshape({sequence, batch, -1});
         PermuteSelf(context, {1, 0, 2});
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(stateLayer) + "_pregate", context);
 
         SigmoidMulTo(context, gate);
         Linear(context, this->weight[attention + "o_proj.weight"], Data(), output);
@@ -5599,6 +5789,12 @@ namespace fastllm {
             }
         }
         const bool fusedDecode = sequence == 1;
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(layer) + "_lqkv", qkv);
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(layer) + "_lalpha", alpha);
+        DumpTensorIfRequested(
+            "layer_" + std::to_string(layer) + "_lbeta", beta);
         // Speculative target verification evaluates only a handful of new
         // tokens.  Advance the recurrent GDN with the exact decode operation
         // for each row so accepted logits are bit-equivalent to ordinary
@@ -5683,6 +5879,12 @@ namespace fastllm {
         // established fp16 rounding semantics remain bit-identical.
         if (fusedDecode || sequentialMtpDecode) {
             Data core;
+            DumpTensorIfRequested(
+                "layer_" + std::to_string(layer) + "_convout",
+                currentConvolved);
+            DumpTensorIfRequested(
+                "layer_" + std::to_string(layer) + "_state_predelta",
+                pastRecurrent);
             if (fusedDecode) {
                 fastllm::GatedDeltaRuleDecode(
                     currentConvolved, alpha, beta,
@@ -5702,6 +5904,8 @@ namespace fastllm {
                     recurrentStateOutput);
             }
             core.Reshape({-1, this->head_v_dim});
+            DumpTensorIfRequested(
+                "layer_" + std::to_string(layer) + "_lcore", core);
             z.Reshape({-1, this->head_v_dim});
             Data gatedCore;
             Data *outputCore = &core;
@@ -5732,8 +5936,25 @@ namespace fastllm {
             }
             outputCore->Reshape({batch, sequence,
                                  this->num_v_heads * this->head_v_dim});
-            Linear(*outputCore,
-                   this->weight[linear + "out_proj.weight"],
+            DumpTensorIfRequested(
+                "layer_" + std::to_string(layer) + "_lfinal",
+                *outputCore);
+            // GGUF keeps out_proj's rows in llama.cpp's per-key-head tiled
+            // order.  The chunk-prefill path below permutes the activation
+            // into that order before the projection; the decode branch needs
+            // the identical permute or every decode step scrambles the
+            // value-head channels through out_proj.
+            Data &decodeOutProjection =
+                this->weight[linear + "out_proj.weight"];
+            if (decodeOutProjection.isGGUFData) {
+                const std::vector<int> coreShape = outputCore->dims;
+                outputCore->Reshape({-1, this->num_k_heads,
+                                     this->num_v_heads / this->num_k_heads,
+                                     this->head_v_dim});
+                PermuteSelf(*outputCore, {0, 2, 1, 3});
+                outputCore->Reshape(coreShape);
+            }
+            Linear(*outputCore, decodeOutProjection,
                    Data(), output);
             ThreadTpAllReduce(output);
             return;
@@ -5926,7 +6147,19 @@ namespace fastllm {
         // gate; Qwen3-Next's default SiLU here would noticeably change logits.
         SigmoidMulTo(allCore, z);
         allCore.Reshape({batch, sequence, valueDimension});
-        Linear(allCore, this->weight[linear + "out_proj.weight"], Data(), output);
+        // GGUF keeps out_proj's rows in llama.cpp's per-key-head tiled order;
+        // permuting the activation into that order is cheaper than rewriting
+        // the packed weight and stays invisible otherwise.
+        Data &outProjection = this->weight[linear + "out_proj.weight"];
+        if (outProjection.isGGUFData) {
+            const std::vector<int> coreShape = allCore.dims;
+            allCore.Reshape({-1, this->num_k_heads,
+                             this->num_v_heads / this->num_k_heads,
+                             this->head_v_dim});
+            PermuteSelf(allCore, {0, 2, 1, 3});
+            allCore.Reshape(coreShape);
+        }
+        Linear(allCore, outProjection, Data(), output);
         ThreadTpAllReduce(output);
     }
 
@@ -11505,10 +11738,17 @@ namespace fastllm {
         if (only != nullptr && only[0] != '\0' && name != only) {
             return;
         }
+        // input_ids is the first dump of each forward: use it to key per-step
+        // files so every forward leaves its own set (no last-writer clobbering)
+        static int dumpStep = -1;
+        if (name == "input_ids") {
+            dumpStep++;
+        }
         Data cpu;
         ToDataType(data, cpu, DataType::FLOAT32);
         cpu.ToDevice(DataDevice::CPU);
-        std::string path = std::string(directory) + "/" + name + ".f32";
+        std::string path = std::string(directory) + "/" + name + "_step" +
+                           std::to_string(dumpStep) + ".f32";
         std::ofstream stream(path, std::ios::binary | std::ios::trunc);
         if (!stream.good()) {
             return;

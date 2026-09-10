@@ -272,7 +272,11 @@ namespace fastllm {
 
         if (DeviceNameMatchesType(selectedDevice, "cuda") &&
             this->IsMoeLayerSpilledToCpu(layerId)) {
-            return "cpu";
+            // Plain-CPU MoE dereferences the activation's host pointer;
+            // with attention on CUDA that pointer is null and CpuMergeMOE
+            // segfaults.  The NUMA MoE path is the cross-device-safe route
+            // for spilled GGUF experts, so prefer it when NUMA is active.
+            return GetFastllmEnv().activateNuma ? "numa" : "cpu";
         }
         return selectedDevice;
     }
@@ -352,6 +356,11 @@ namespace fastllm {
         }
         uint64_t totalWeightBytes = 0;
         for (const auto &it : this->weight.weight) {
+            if (this->IsHostOnlyWeight(it.first)) {
+                // Host-resident weights (e.g. the qwen4exp PLE ngram table)
+                // never occupy VRAM; counting them would starve the budget.
+                continue;
+            }
             totalWeightBytes += it.second.GetBytes();
         }
         this->BuildMoeCudaSpillPlanLocked(layerBytes, expertBytes, totalWeightBytes);
@@ -373,6 +382,11 @@ namespace fastllm {
         uint64_t expertBytes = 0;
         uint64_t totalWeightBytes = 0;
         for (const auto &it : tensorNameAndBytes) {
+            if (this->IsHostOnlyWeight(it.first)) {
+                // Host-resident weights (e.g. the qwen4exp PLE ngram table)
+                // never occupy VRAM; counting them would starve the budget.
+                continue;
+            }
             totalWeightBytes += it.second;
             int layerId = GetMoeExpertWeightLayerId(this, it.first);
             if (layerId >= 0 && layerId < this->block_cnt) {
@@ -3261,6 +3275,7 @@ namespace fastllm {
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
             {"qwen35moe", "qwen3_5_moe"}, {"qwen3_5_moe", "qwen3_5_moe"},
+            {"qwen4exp", "qwen4_exp"}, {"qwen4_exp", "qwen4_exp"}, // qwen4_exp
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2

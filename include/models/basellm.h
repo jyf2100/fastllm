@@ -604,6 +604,13 @@ namespace fastllm {
                                          uint64_t totalWeightBytes) const; // call with moeCudaSpillLock held
 
         void AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId = -1);
+        // True for weights that stay on the host regardless of the device
+        // map (e.g. qwen4exp's PLE ngram table follows --ngram_device).
+        // The MoE CUDA spill budget must not subtract them from VRAM.
+        virtual bool IsHostOnlyWeight(const std::string &weightName) const {
+            (void)weightName;
+            return false;
+        }
         bool UseLayeredMoeDevice(int layerId) const;
         std::string SelectMoeDeviceForLayer(int layerId) const;
         bool IsMoeLayerSpilledToCpu(int layerId) const;

@@ -282,7 +282,175 @@ namespace fastllm {
                 }
             },
             {
-                "deepseek_v2", 
+                // Qwen3.8-Flash-Next (qwen4exp).  Hyper-connections replace
+                // the classic attn_norm/ffn_norm/final norm, so the GGUF only
+                // carries hc_*/ssm_norm/q_norm tensors — matching the HF
+                // checkpoint one-to-one.  Two special cases:
+                //  - the indexer projection is split into q/k halves which
+                //    feed the __0/__1 merge inputs (fused [q; k] order);
+                //  - the 128 PLE ngram shards are flattened into one
+                //    [rows, ple_head_dim] table aliased as shard_0; the row
+                //    space equals the HF shards concatenated in order.
+                "qwen4exp",
+                {
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_(q|k|v)\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.$2_proj.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_(q|k)_norm\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.$2_norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_output\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.o_proj.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.indexer\.q_proj\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.indexer.index_qk_proj.weight__0"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.indexer\.k_proj\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.indexer.index_qk_proj.weight__1"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.indexer\.q_norm\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.indexer.q_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.indexer\.k_norm\.weight$)"),
+                        "model.language_model.layers.$1.self_attn.indexer.k_layernorm.weight"
+                    ),
+                    // GDN linear attention
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_qkv\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_qkv.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.attn_gate\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_z.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_beta\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_b.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_alpha\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_a.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_conv1d\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.conv1d.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_a$)"),
+                        "model.language_model.layers.$1.linear_attn.A_log"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_dt\.bias$)"),
+                        "model.language_model.layers.$1.linear_attn.dt_bias"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_norm\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ssm_out\.weight$)"),
+                        "model.language_model.layers.$1.linear_attn.out_proj.weight"
+                    ),
+                    // MoE
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ffn_gate_inp\.weight$)"),
+                        "model.language_model.layers.$1.mlp.gate.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ffn_gate_inp_shexp\.weight$)"),
+                        "model.language_model.layers.$1.mlp.shared_expert_gate.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_shexp\.weight$)"),
+                        "model.language_model.layers.$1.mlp.shared_expert.$2_proj.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$)"),
+                        std::vector <std::string> ({"model.language_model.layers.$1.mlp.experts.", ".$2_proj.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ),
+                    // hyper-connections.  llama.cpp names the FFN-side
+                    // connection "ffn"; the model's tensor map calls the same
+                    // module "mlp_hyper_connection", so the two sides need
+                    // separate rules.
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_attn_down\.weight$)"),
+                        "model.language_model.layers.$1.attn_hyper_connection.input_mix_weight_down.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_attn_up\.weight$)"),
+                        "model.language_model.layers.$1.attn_hyper_connection.input_mix_weight_up.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_attn_inject\.weight$)"),
+                        "model.language_model.layers.$1.attn_hyper_connection.block_inject_weight.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_attn_norm\.weight$)"),
+                        "model.language_model.layers.$1.attn_hyper_connection.hc_norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_ffn_down\.weight$)"),
+                        "model.language_model.layers.$1.mlp_hyper_connection.input_mix_weight_down.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_ffn_up\.weight$)"),
+                        "model.language_model.layers.$1.mlp_hyper_connection.input_mix_weight_up.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_ffn_inject\.weight$)"),
+                        "model.language_model.layers.$1.mlp_hyper_connection.block_inject_weight.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.(\d+)\.hc_ffn_norm\.weight$)"),
+                        "model.language_model.layers.$1.mlp_hyper_connection.hc_norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^output_hc_down\.weight$)"),
+                        "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^output_hc_up\.weight$)"),
+                        "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^output_hc_norm\.weight$)"),
+                        "model.language_model.hyper_connection_mixer.hc_norm.weight"
+                    ),
+                    // PLE lives on the single layer indexed by ple_layer_ids
+                    // minus one (HF ple_layer_ids=[2] -> blk.1 in the GGUF).
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.1\.ple_(key|value)\.weight$)"),
+                        "model.language_model.layers.1.ple.$1_proj.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.1\.ple_(conv1d|norm_conv|norm_key|norm_query)\.weight$)"),
+                        "model.language_model.layers.1.ple.$1.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^per_layer_token_embd\.weight$)"),
+                        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^token_embd\.weight$)"),
+                        "model.language_model.embed_tokens.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^output\.weight$)"),
+                        "lm_head.weight"
+                    )
+                }
+            },
+            {
+                "deepseek_v2",
                 {
                     GGUFWeightReplaceRule (
                         std::regex(R"(blk\.(\d+)\.attn_q_(a|b)\.(weight|bias))"),
@@ -528,6 +696,7 @@ namespace fastllm {
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
             {"qwen2", originalArchRulesDict["default"]},
             {"qwen35", originalArchRulesDict["qwen3_5"]},
+            {"qwen4_exp", originalArchRulesDict["qwen4exp"]},
             {"kimi_k2", originalArchRulesDict["deepseek_v2"]},
         };
 

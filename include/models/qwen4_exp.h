@@ -34,6 +34,9 @@ namespace fastllm {
                 const std::string &weightName) const override;
         bool ShouldDelaySpecialWeightCudaMove(
                 const std::string &weightName) const override;
+        // The PLE ngram table follows --ngram_device (host or disk) and
+        // never occupies VRAM, so the MoE CUDA spill budget skips it.
+        bool IsHostOnlyWeight(const std::string &weightName) const override;
 
         int Forward(
                 const Data &inputIds,
@@ -325,6 +328,8 @@ namespace fastllm {
         void PrepareWeights();
         void PrepareMtpDraftLmHeadWeight();
         bool IsLinearAttentionLayer(int layer) const;
+        void RestoreGgufGdnWeights();
+        bool ggufGdnLayoutRestored = false;
         void PrepareVision();
         void ApplyVisionRotary(Data &input, const Data &posX,
                                const Data &posY);
