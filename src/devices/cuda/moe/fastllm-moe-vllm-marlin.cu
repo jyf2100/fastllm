@@ -2471,11 +2471,17 @@ static bool RunAwqMarlinMoe(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int batch, int topk) {
+    // Topk is a runtime parameter of every generic Marlin kernel below
+    // (only the hidden=2048/intermediate=256 decode specialization is
+    // topk-8-locked), so accept up to 16 like the NVFP4 variant.  An FP32
+    // input is mirrored to FP16 before the kernels run (same staging as the
+    // NVFP4 variant), so FP32-activation graphs also take this path.
     if (input.dataDevice != fastllm::DataDevice::CUDA ||
-        input.dataType != fastllm::DataType::FLOAT16 ||
+        (input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::FLOAT32) ||
         input.dims.size() != 2 || input.dims[0] != batch ||
         input.cudaData == nullptr || indices == nullptr || scores == nullptr ||
-        batch <= 0 || topk <= 0 || topk > 8) {
+        batch <= 0 || topk <= 0 || topk > 16) {
         if (AwqCompactFallbackUnavailable(weights, weightsBatch)) {
             FailAwqMarlinAfterRepack("received an incompatible invocation");
         }
@@ -2500,7 +2506,7 @@ static bool RunAwqMarlinMoe(
         activation.dataDeviceIds = input.dataDeviceIds;
         activation.Resize({topk, cache->intermediate});
         activation.Allocate(false);
-        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataType = input.dataType;
         output.dataDevice = fastllm::DataDevice::CUDA;
         output.dataDeviceIds = input.dataDeviceIds;
         output.Resize(input.dims);
@@ -2510,11 +2516,39 @@ static bool RunAwqMarlinMoe(
                                      cache.get());
         }
 
+        // The decode kernels run in FP16.  With an FP32 MoE input, mirror
+        // the row into gateOutput; after the gate/up pass has consumed the
+        // mirror, the same buffer stages the half result that is converted
+        // back into the FP32 output.
+        const half *inputHalf = (const half *)input.cudaData;
+        half *outputHalf = (half *)output.cudaData;
+        if (input.dataType == fastllm::DataType::FLOAT32) {
+            gateOutput.dataType = fastllm::DataType::FLOAT16;
+            gateOutput.dataDevice = fastllm::DataDevice::CUDA;
+            gateOutput.dataDeviceIds = input.dataDeviceIds;
+            gateOutput.Resize({batch, cache->hidden});
+            gateOutput.Allocate(false);
+            if (gateOutput.cudaData == nullptr) {
+                FailAwqMarlinAfterRepack("decode buffer allocation",
+                                         cache.get());
+            }
+            FastllmCudaFloat2HalfKernel<<<
+                (cache->hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                (float *)input.cudaData, (half *)gateOutput.cudaData,
+                cache->hidden);
+            if (cudaPeekAtLastError() != cudaSuccess) {
+                FailAwqMarlinAfterRepack("input FP16 conversion launch",
+                                         cache.get());
+            }
+            inputHalf = (const half *)gateOutput.cudaData;
+            outputHalf = (half *)gateOutput.cudaData;
+        }
+
         if (cache->hidden == 2048 && cache->intermediate == 256) {
             AwqMarlinMoeDecodeGateupH2048N256Top8Kernel
                 <<< topk * (256 / 16), 8 * 32,
                     0, cudaStreamPerThread >>>(
-                    (const half *)input.cudaData, cache->gateWeight,
+                    inputHalf, cache->gateWeight,
                     cache->gateDecodeScale, cache->gateDecodeZero,
                     indices, (half *)activation.cudaData,
                     cache->experts);
@@ -2524,7 +2558,7 @@ static bool RunAwqMarlinMoe(
             AwqMarlinMoeDecodeGateupSwigluKernel<warps>
                 <<< (tasks + warps - 1) / warps, warps * 32,
                     0, cudaStreamPerThread >>>(
-                    (const half *)input.cudaData, cache->gateWeight,
+                    inputHalf, cache->gateWeight,
                     cache->gateDecodeScale, cache->gateDecodeZero, indices,
                     (half *)activation.cudaData, topk, cache->experts,
                     cache->hidden, cache->intermediate);
@@ -2534,7 +2568,7 @@ static bool RunAwqMarlinMoe(
                 <<< 2048 / 16, 16 * 32, 0, cudaStreamPerThread >>>(
                     (const half *)activation.cudaData, cache->downWeight,
                     cache->downDecodeScale, cache->downDecodeZero,
-                    indices, scores, (half *)output.cudaData,
+                    indices, scores, outputHalf,
                     topk, cache->experts);
         } else if (cache->intermediate == 256) {
             AwqMarlinMoeDecodeDownKernel<8, 16>
@@ -2542,7 +2576,7 @@ static bool RunAwqMarlinMoe(
                     (const half *)activation.cudaData, cache->downWeight,
                     cache->downDecodeScale, cache->downDecodeZero,
                     indices, scores,
-                    (half *)output.cudaData, topk, cache->experts,
+                    outputHalf, topk, cache->experts,
                     cache->hidden, cache->intermediate);
         } else {
             AwqMarlinMoeDecodeDownKernel<8, 32>
@@ -2550,11 +2584,22 @@ static bool RunAwqMarlinMoe(
                     (const half *)activation.cudaData, cache->downWeight,
                     cache->downDecodeScale, cache->downDecodeZero,
                     indices, scores,
-                    (half *)output.cudaData, topk, cache->experts,
+                    outputHalf, topk, cache->experts,
                     cache->hidden, cache->intermediate);
         }
         if (cudaPeekAtLastError() != cudaSuccess) {
             FailAwqMarlinAfterRepack("decode kernel launch", cache.get());
+        }
+        if (outputHalf != output.cudaData) {
+            FastllmCudaHalf2FloatKernel<<<
+                (batch * cache->hidden + 255) / 256, 256,
+                0, cudaStreamPerThread>>>(
+                (half *)gateOutput.cudaData, (float *)output.cudaData,
+                batch * cache->hidden);
+            if (cudaPeekAtLastError() != cudaSuccess) {
+                FailAwqMarlinAfterRepack("output FP32 conversion launch",
+                                         cache.get());
+            }
         }
         return true;
     }
@@ -2579,9 +2624,14 @@ static bool RunAwqMarlinMoe(
     activation.dataType = fastllm::DataType::FLOAT16;
     activation.dataDevice = fastllm::DataDevice::CUDA;
     activation.dataDeviceIds = input.dataDeviceIds;
-    activation.Resize({routes, cache->intermediate});
+    // An FP32 MoE input is mirrored to FP16 at the front of the activation
+    // buffer (same staging as the NVFP4 variant); the gate/up Marlin pass
+    // consumes the mirror before SwiGLU overwrites it.
+    const int inputElements = batch * cache->hidden;
+    const int activationElements = routes * cache->intermediate;
+    activation.Resize({std::max(inputElements, activationElements)});
     activation.Allocate(false);
-    output.dataType = fastllm::DataType::FLOAT16;
+    output.dataType = input.dataType;
     output.dataDevice = fastllm::DataDevice::CUDA;
     output.dataDeviceIds = input.dataDeviceIds;
     output.Resize(input.dims);
@@ -2593,6 +2643,18 @@ static bool RunAwqMarlinMoe(
 
     cudaStream_t stream = cudaStreamPerThread;
     constexpr int threads = 256;
+    const void *marlinInput = input.cudaData;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmCudaFloat2HalfKernel<<<
+            (inputElements + threads - 1) / threads, threads, 0, stream>>>(
+            (float *)input.cudaData, (half *)activation.cudaData,
+            inputElements);
+        if (cudaPeekAtLastError() != cudaSuccess) {
+            FailAwqMarlinAfterRepack("input FP16 conversion launch",
+                                     cache.get());
+        }
+        marlinInput = activation.cudaData;
+    }
     LaunchAwqMoeRouteMetadata(
         indices, cache->expertCounts, cache->expertStarts,
         routeStorage->sortedTokenIds,
@@ -2604,7 +2666,7 @@ static bool RunAwqMarlinMoe(
     }
 
     if (!LaunchAwqMarlinMoe(
-            true, smallBatch, input.cudaData, cache->gateWeight,
+            true, smallBatch, marlinInput, cache->gateWeight,
             gateOutput.cudaData, cache->temporaryOutput,
             cache->gateScale, cache->gateZero,
             routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
@@ -2613,7 +2675,6 @@ static bool RunAwqMarlinMoe(
             cache->hidden, cache->workspace, stream, cache->sms)) {
         FailAwqMarlinAfterRepack("gate/up Marlin launch", cache.get());
     }
-    int activationElements = routes * cache->intermediate;
     SwigluRowsKernel<<<
         (activationElements + threads - 1) / threads, threads, 0, stream>>>(
         (const half *)gateOutput.cudaData,
@@ -2632,11 +2693,19 @@ static bool RunAwqMarlinMoe(
             cache->workspace, stream, cache->sms)) {
         FailAwqMarlinAfterRepack("down Marlin launch", cache.get());
     }
-    int outputPairs = batch * (cache->hidden / 2);
-    SumAwqMoeRowsKernel<<<
-        (outputPairs + threads - 1) / threads, threads, 0, stream>>>(
-        (const half *)gateOutput.cudaData, (half *)output.cudaData,
-        batch, topk, cache->hidden);
+    if (output.dataType == fastllm::DataType::FLOAT32) {
+        const int outputElements = batch * cache->hidden;
+        SumAwqMoeRowsFloatKernel<<<
+            (outputElements + threads - 1) / threads, threads, 0, stream>>>(
+            (const half *)gateOutput.cudaData,
+            (float *)output.cudaData, batch, topk, cache->hidden);
+    } else {
+        int outputPairs = batch * (cache->hidden / 2);
+        SumAwqMoeRowsKernel<<<
+            (outputPairs + threads - 1) / threads, threads, 0, stream>>>(
+            (const half *)gateOutput.cudaData, (half *)output.cudaData,
+            batch, topk, cache->hidden);
+    }
     if (cudaPeekAtLastError() != cudaSuccess) {
         FailAwqMarlinAfterRepack("output-reduction launch", cache.get());
     }

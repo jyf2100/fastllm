@@ -9257,11 +9257,18 @@ namespace fastllm {
             weights != nullptr && weightsBatch >= 4 &&
             weights[2] != nullptr &&
             weights[2]->dataType == DataType::INT4_GROUP;
+        // The grouped-Marlin kernels take topk as a runtime parameter
+        // (routes = batch * topk); only the shape-specialized decode pair is
+        // topk-8-locked, so topk up to 16 is accepted to cover models such as
+        // Qwen3.8-Flash-Next (512 experts, topk = 10).  FP32 inputs are
+        // mirrored to FP16 inside the kernel wrapper (same staging as the
+        // NVFP4 variant), so FP32-activation graphs take this path too.
         if (gateType != MoeGateSwiglu ||
-            input.dataType != DataType::FLOAT16 ||
+            (input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::FLOAT32) ||
             input.dataDevice != DataDevice::CUDA ||
             input.dims.size() != 2 || input.dims[0] != batch ||
-            batch <= 0 || topk <= 0 || topk > 8 ||
+            batch <= 0 || topk <= 0 || topk > 16 ||
             index.dataDevice != DataDevice::CUDA ||
             index.dataType != DataType::INT32 ||
             score.dataDevice != DataDevice::CUDA ||

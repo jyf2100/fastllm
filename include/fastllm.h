@@ -413,6 +413,12 @@ namespace fastllm {
         bool crossSwiglu = false, bool planar = false);
     void ConvertCompactE4M3NVFP4ToBlock16(
         Data &data, bool crossSwiglu = false);
+    // Requantizes a resident GGUF block-quantized matrix (Q4_K, Q5_1, Q8_0,
+    // ... — any type with a dequantizer) to INT4_GROUP (group size 32,
+    // integer zero points) so CUDA MoE experts dispatch to the indexed
+    // Marlin path instead of the per-expert dequant + SGEMM fallback.
+    // Returns false when the tensor does not qualify.
+    bool TryRequantGgufWeightToInt4GroupMarlin(Data &data);
 
     enum DataDevice {
         CPU = 0, CUDA = 1

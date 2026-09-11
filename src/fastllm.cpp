@@ -737,6 +737,117 @@ namespace fastllm {
         memcpy(data.cpuData, packed.data(), packedBytes);
     }
 
+    // GGUF Q4_K -> INT4_GROUP(group 32, integer zero point) requant.
+    // The affine grid keeps min = -zero * scale exactly, so -min / scale is
+    // integral — the AWQ Marlin MoE path packs zero points as 4-bit values
+    // and rejects anything else.
+    bool TryRequantGgufWeightToInt4GroupMarlin(Data &data) {
+        if (data.dataType != DataType::DATA_GGUF_FORMAT ||
+            data.dataDevice != DataDevice::CPU || data.cpuData == nullptr ||
+            data.isDiskWeight || data.isFake || data.multiDeviceData ||
+            !data.numasData.empty() || data.dims.size() != 2 ||
+            data.ggmlType < 0) {
+            return false;
+        }
+        const int rows = data.dims[0];
+        const int columns = data.dims[1];
+        // BuildAwqLayerCache gates (gate rows % 256, hidden % 128) accept
+        // both projections via rows % 256 && columns % 128; the marlin
+        // repack additionally needs the input dimension % 64.
+        if (rows % 256 != 0 || columns % 64 != 0) {
+            return false;
+        }
+        // Any GGML block format with a dequantizer works: UD dynamic quants
+        // mix Q4_K gate/up with Q5_1/Q8_0 down projections.
+        auto toFloat = ggml_type_to_float((ggml_type)data.ggmlType);
+        if (toFloat == nullptr) {
+            return false;
+        }
+        std::vector <float> fp32((long long)rows * columns);
+        toFloat(data.cpuData, fp32.data(), rows * columns);
+
+        const int groupCnt = 32;
+        const int group = columns / groupCnt;
+        std::vector <uint8_t> packed(((long long)rows * columns) / 2);
+        std::vector <float> scales((long long)rows * group);
+        std::vector <float> mins((long long)rows * group);
+        std::vector <int> zeros((long long)rows * group);
+        for (int r = 0; r < rows; r++) {
+            const float *row = fp32.data() + (long long)r * columns;
+            uint8_t *rowPacked = packed.data() + (long long)r * (columns / 2);
+            for (int g = 0; g < group; g++) {
+                const float *w = row + (long long)g * groupCnt;
+                float maxPos = 0.0f, maxNeg = 0.0f;
+                for (int j = 0; j < groupCnt; j++) {
+                    const float value = w[j];
+                    maxPos = std::max(maxPos, value);
+                    maxNeg = std::max(maxNeg, -value);
+                }
+                // Pick the integer zero point z in [1, 14] whose grid
+                // (q - z) * scale covers [-maxNeg, maxPos] with the
+                // smallest scale; outliers clamp to the grid edge.
+                int zero = 8;
+                float scale = std::max(maxPos / 7.0f, maxNeg / 8.0f);
+                for (int z = 1; z < 15; z++) {
+                    const float candidate = std::max(maxPos / (float)(15 - z),
+                                                     maxNeg / (float)z);
+                    if (candidate < scale) {
+                        scale = candidate;
+                        zero = z;
+                    }
+                }
+                if (scale <= 0.0f) {
+                    scale = 0.0f;
+                }
+                for (int j = 0; j < groupCnt; j++) {
+                    int q = scale > 0.0f ? (int)std::lroundf(w[j] / scale) + zero
+                                         : zero;
+                    q = std::max(0, std::min(15, q));
+                    // j indexes within the group; the byte offset must skip
+                    // the group's 16 packed bytes inside the row.
+                    uint8_t &slot =
+                        rowPacked[(long long)g * (groupCnt / 2) + j / 2];
+                    if (j % 2 == 0) {
+                        slot = (uint8_t)(q << 4);
+                    } else {
+                        slot |= (uint8_t)q;
+                    }
+                }
+                const long long index = (long long)r * group + g;
+                scales[index] = scale;
+                mins[index] = -zero * scale;
+                zeros[index] = zero;
+            }
+        }
+
+        data.FreeSpace();
+        // FreeSpace deliberately does not delete an mmap-backed pointer.
+        data.mapFile.reset();
+        data.dataType = DataType::INT4_GROUP;
+        data.group = group;
+        data.groupCnt = groupCnt;
+        data.perChannelAxis = 0;
+        data.scales = std::move(scales);
+        data.mins = std::move(mins);
+        data.zeros = std::move(zeros);
+        data.isGGUFData = false;
+        data.ggmlType = -1;
+        data.ggmlTensor = nullptr;
+        data.forceGGUFFp32Dequant = false;
+        data.IsRepacked = false;
+        // GGUF-imported tensors set dims directly without Resize, which
+        // leaves strides empty; Count/GetBytes degenerate and Allocate
+        // no-ops.  Re-Resize to rebuild strides for the new type (this also
+        // refreshes unitSize) before allocating.
+        data.Resize({rows, columns});
+        data.Allocate(false);
+        AssertInFastLLM(data.cpuData != nullptr &&
+                        data.GetBytes() == packed.size(),
+                        "GGUF -> INT4_GROUP requant allocation failed.\n");
+        memcpy(data.cpuData, packed.data(), packed.size());
+        return true;
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (rows == 0 || columns == 0) {
             return 0;

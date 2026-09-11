@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <climits>
+#include <atomic>
 #include <algorithm>
 #include <cctype>
 #include <mutex>
@@ -975,6 +976,36 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (data.isDiskWeight || (data.dataDevice == DataDevice::CPU && data.cpuData == nullptr && data.numasData.empty())) {
             return false;
+        }
+        // Opt-in (FT_GGUF_MOE_MARLIN=1): requantize CUDA-resident GGUF MoE
+        // experts (any block-quant type — UD dynamic quants mix Q4_K gate/up
+        // with Q5_1/Q8_0 down) to INT4_GROUP(32) before the upload so the
+        // first forward dispatches to the graph-safe indexed Marlin MoE path
+        // instead of the per-expert dequant + SGEMM fallback.  CPU-spilled
+        // experts stay GGUF (the numa path only knows the GGUF layout).  The
+        // routed path additionally requires fp16 MoE input (deploy with
+        // --atype=float16).
+        static const bool ggufMoeMarlinRequant = [] {
+            const char *env = getenv("FT_GGUF_MOE_MARLIN");
+            if (env == nullptr) {
+                return false;
+            }
+            std::string value(env);
+            std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+            return value == "1" || value == "on" || value == "true";
+        }();
+        if (ggufMoeMarlinRequant && selectedCuda && !selectedMultiCuda &&
+                weightName.find(".experts.") != std::string::npos &&
+                data.dataType == DataType::DATA_GGUF_FORMAT &&
+                TryRequantGgufWeightToInt4GroupMarlin(data)) {
+            static std::atomic <int> requantCount {0};
+            const int done = ++requantCount;
+            if (done == 1 || done % 512 == 0) {
+                printf("[Fastllm] GGUF MoE marlin requant: %d expert "
+                       "tensors converted (last: %s).\n",
+                       done, weightName.c_str());
+                fflush(stdout);
+            }
         }
         std::map <int, int> ratios;
         std::vector <int> deviceIds = ParseDeviceIds(selectedDevice,
