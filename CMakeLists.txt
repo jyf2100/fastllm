@@ -752,6 +752,44 @@ if (UNIT_TEST)
         add_test(NAME cuda_single_prefill_dispatch COMMAND cuda_single_prefill_dispatch_test)
         set_tests_properties(cuda_single_prefill_dispatch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
 
+        add_executable(cudaFp8Sm75PrefillRegression test/ops/cudaFp8Sm75PrefillRegression.cu)
+        target_link_libraries(cudaFp8Sm75PrefillRegression PRIVATE fastllm)
+        set_target_properties(cudaFp8Sm75PrefillRegression PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        foreach(fp8_workspace_mb IN ITEMS 4 32 64 256)
+            add_test(NAME cuda_fp8_sm75_prefill_${fp8_workspace_mb}m
+                     COMMAND cudaFp8Sm75PrefillRegression)
+            set_tests_properties(cuda_fp8_sm75_prefill_${fp8_workspace_mb}m PROPERTIES
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=${fp8_workspace_mb}M;FASTLLM_CUDA_FP8_PREFILL_CUBLAS=1")
+        endforeach()
+        add_test(NAME cuda_fp8_sm75_prefill_disabled COMMAND cudaFp8Sm75PrefillRegression)
+        set_tests_properties(cuda_fp8_sm75_prefill_disabled PROPERTIES
+            LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+            ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=256M;FASTLLM_CUDA_FP8_PREFILL_CUBLAS=0")
+
+        add_executable(cudaNvfp4Sm75PrefillRegression test/ops/cudaNvfp4Sm75PrefillRegression.cu)
+        target_link_libraries(cudaNvfp4Sm75PrefillRegression PRIVATE fastllm)
+        set_target_properties(cudaNvfp4Sm75PrefillRegression PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        foreach(nvfp4_fp16_accum IN ITEMS 0 1)
+            set(nvfp4_test_prefix cuda_nvfp4_sm75_prefill)
+            if (nvfp4_fp16_accum)
+                string(APPEND nvfp4_test_prefix _fp16)
+            endif()
+            foreach(nvfp4_workspace_mb IN ITEMS 4 32 256)
+                add_test(NAME ${nvfp4_test_prefix}_${nvfp4_workspace_mb}m
+                         COMMAND cudaNvfp4Sm75PrefillRegression)
+                set_tests_properties(${nvfp4_test_prefix}_${nvfp4_workspace_mb}m PROPERTIES
+                    LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                    ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=${nvfp4_workspace_mb}M;FASTLLM_CUDA_FP8_PREFILL_CUBLAS=1;FASTLLM_CUDA_NVFP4_PREFILL_CUBLAS=1;FASTLLM_CUDA_NVFP4_PREFILL_FP16_ACCUM=${nvfp4_fp16_accum}")
+            endforeach()
+            add_test(NAME ${nvfp4_test_prefix}_disabled COMMAND cudaNvfp4Sm75PrefillRegression)
+            set_tests_properties(${nvfp4_test_prefix}_disabled PROPERTIES
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=256M;FASTLLM_CUDA_FP8_PREFILL_CUBLAS=1;FASTLLM_CUDA_NVFP4_PREFILL_CUBLAS=0;FASTLLM_CUDA_NVFP4_PREFILL_FP16_ACCUM=${nvfp4_fp16_accum}")
+        endforeach()
+
         add_executable(cudaGgufChunkedDequantRegression test/ops/cudaGgufChunkedDequantRegression.cu)
         target_link_libraries(cudaGgufChunkedDequantRegression PRIVATE fastllm)
         target_include_directories(cudaGgufChunkedDequantRegression PRIVATE src/devices/cuda)
