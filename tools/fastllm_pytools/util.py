@@ -584,6 +584,17 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
             "disabled; CUDA graph selection is unchanged.",
             flush=True,
         )
+    if int(getattr(args, "lookup", 0) or 0) > 0:
+        # prompt-lookup 与 GPU token handoff 互斥:handoff 消费分支先于
+        # MTP 分支且可自链,会饿死 lookup 探测。强制关闭(仿 low_gpu_mem,
+        # 覆盖显式设置);CUDA graph / embedding 自动路径不受影响。
+        os.environ[handoff_env] = "0"
+        print(
+            "[Fastllm] --lookup: GPU token handoff disabled (mutual "
+            "exclusion with prompt-lookup drafting); CUDA graph and CUDA "
+            "embedding selection are unchanged.",
+            flush=True,
+        )
     low_memory_gguf = eligible and _qwen35_gguf_needs_low_memory_fast_paths(
         args)
     if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
@@ -814,6 +825,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--lookup", type = int, default = 0, help = "prompt-lookup 草稿数（从 prompt/已生成 token 的 n-gram 重复片段查草稿，零草稿模型），0 表示关闭（默认），当前最大 8；与 --mtp/--dspark/--speculative_algorithm 互斥，仅支持 qwen3_5 族，greedy 无损")
     parser.add_argument("--dspark", type = int, default = 0,
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
@@ -915,6 +927,21 @@ def make_normal_llm_model(args, startup_progress = None):
     dspark_tokens = int(getattr(args, "dspark", 0) or 0)
     if dspark_tokens < 0:
         raise ValueError("--dspark must be >= 0")
+    try:
+        lookup = int(getattr(args, "lookup", 0) or 0)
+    except Exception:
+        lookup = 0
+    if lookup < 0 or lookup > 8:
+        raise ValueError("--lookup must be within [0, 8]")
+    args.lookup = lookup
+    if lookup > 0:
+        if mtp > 0:
+            raise ValueError("--lookup and --mtp cannot be enabled together")
+        if dspark_tokens > 0:
+            raise ValueError("--lookup and --dspark cannot be enabled together")
+        if speculative_algorithm == "dflash":
+            raise ValueError("--lookup and --speculative_algorithm dflash "
+                             "cannot be enabled together")
     if mtp > 0 and dspark_tokens > 0:
         raise ValueError("MTP and --dspark cannot be enabled together")
     if mtp > 0 and not speculative_algorithm:
@@ -1199,6 +1226,12 @@ def make_normal_llm_model(args, startup_progress = None):
                                  "DeepSeekV4ForCausalLM") or
                 model_type == "deepseek_v4"
             )
+            if (lookup > 0 and not is_qwen35_model):
+                raise ValueError(
+                    "--lookup currently supports only the qwen3_5 model "
+                    "family (Qwen3.5 / Qwen3.5-MoE); found architecture=%s "
+                    "model_type=%s" %
+                    (architecture or "unknown", model_type or "unknown"))
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -1577,6 +1610,9 @@ def make_normal_llm_model(args, startup_progress = None):
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
         llm.set_cuda_slab(args.cuda_slab)
     os.environ["FASTLLM_QWEN35_ENABLE_MTP"] = str(mtp)
+    # prompt-lookup 草稿数透传(镜像 FASTLLM_QWEN35_ENABLE_MTP 链路)。
+    os.environ["FASTLLM_QWEN35_LOOKUP_DRAFTS"] = str(
+        lookup if is_qwen35_model else 0)
     # Qwen3.8-Flash-Next 的 FP8 checkpoint 声明 model_type=qwen4_exp（同架构别名），同样启用 MTP
     os.environ["FASTLLM_QWEN4_ENABLE_MTP"] = str(
         mtp if (is_qwen38_flash_next_model or model_type == "qwen4_exp" or

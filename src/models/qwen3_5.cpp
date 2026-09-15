@@ -750,6 +750,72 @@ namespace fastllm {
         return Qwen35MtpDraftsPerStep() <= 0;
     }
 
+    // prompt-lookup 草稿数(--lookup 透传,镜像 FASTLLM_QWEN35_ENABLE_MTP 链路)。
+    static int Qwen35LookupDraftsPerStep() {
+        const char *env = std::getenv("FASTLLM_QWEN35_LOOKUP_DRAFTS");
+        if (env == nullptr || env[0] == '\0') {
+            return 0;
+        }
+        int value = atoi(env);
+        return std::max(0, std::min(value, QWEN35_MTP_MAX_DRAFTS));
+    }
+
+    static int Qwen35LookupEnvInt(const char *name, int fallback, int lo, int hi) {
+        const char *env = std::getenv(name);
+        if (env == nullptr || env[0] == '\0') {
+            return fallback;
+        }
+        int value = atoi(env);
+        if (value < lo || value > hi) {
+            ErrorInFastLLM(std::string("Qwen3.5 Lookup env ") + name +
+                           " is out of range [" + std::to_string(lo) + ", " +
+                           std::to_string(hi) + "].\n");
+        }
+        return value;
+    }
+
+    // n-gram 窗口与容量(spec: prompt-lookup-drafting 配置域)。
+    static fastllm::PromptLookupIndex::Config Qwen35LookupIndexConfig() {
+        fastllm::PromptLookupIndex::Config config;
+        config.ngramMin = Qwen35LookupEnvInt("FASTLLM_LOOKUP_NGRAM_MIN", 2, 1, 8);
+        config.ngramMax = Qwen35LookupEnvInt("FASTLLM_LOOKUP_NGRAM_MAX", 4, 1, 16);
+        if (config.ngramMin > config.ngramMax) {
+            ErrorInFastLLM("Qwen3.5 Lookup env requires FASTLLM_LOOKUP_NGRAM_MIN <= "
+                           "FASTLLM_LOOKUP_NGRAM_MAX.\n");
+        }
+        const char *entries = std::getenv("FASTLLM_LOOKUP_MAX_ENTRIES");
+        config.maxEntries = entries == nullptr || entries[0] == '\0' ?
+            262144 : (size_t)atoll(entries);
+        if (config.maxEntries == 0) {
+            ErrorInFastLLM("Qwen3.5 Lookup env FASTLLM_LOOKUP_MAX_ENTRIES must be > 0.\n");
+        }
+        return config;
+    }
+
+    // 自适应停发参数(spec: prompt-lookup-decoding/adaptive-pause)。
+    static int Qwen35LookupPauseWindow() {
+        return Qwen35LookupEnvInt("FASTLLM_LOOKUP_PAUSE_WINDOW", 64, 8, 1000000);
+    }
+    static int Qwen35LookupProbeInterval() {
+        return Qwen35LookupEnvInt("FASTLLM_LOOKUP_PROBE_INTERVAL", 256, 1, 1000000);
+    }
+    static double Qwen35LookupPauseThreshold() {
+        const char *env = std::getenv("FASTLLM_LOOKUP_PAUSE_THRESHOLD");
+        if (env == nullptr || env[0] == '\0') {
+            return 0.10;
+        }
+        double value = atof(env);
+        if (value < 0.0 || value > 1.0) {
+            ErrorInFastLLM("Qwen3.5 Lookup env FASTLLM_LOOKUP_PAUSE_THRESHOLD "
+                           "must be within [0, 1].\n");
+        }
+        return value;
+    }
+
+    // lookup 命中率统计(5.1:hit_rate 与 pos_accept_rate 并列输出)。
+    static std::atomic<long long> gLookupProbeCount{0};
+    static std::atomic<long long> gLookupHitCount{0};
+
     static bool Qwen35MtpWarmupEnabled() {
         const char *env = std::getenv("FASTLLM_QWEN35_MTP_WARMUP");
         return env == nullptr || env[0] == '\0' || Qwen35MoeIsTrueString(env);
@@ -10135,6 +10201,7 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(mtpCacheMutex);
         mtpCaches.erase(context);
         dflashContexts.erase(context);
+        lookupStates.erase(context);
     }
 
     void Qwen3_5Model::OnResponseContextRemoved(ResponseContext *context) {
@@ -10144,6 +10211,7 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(mtpCacheMutex);
         mtpCaches.erase(context);
         dflashContexts.erase(context);
+        lookupStates.erase(context);
     }
 
     bool Qwen3_5Model::UseModelSpecificScheduler() const {
@@ -10153,9 +10221,31 @@ namespace fastllm {
         bool useMtpScheduler = !Qwen35MtpDisabledByEnv() &&
                                HasMtpWeights();
         bool useDFlashScheduler = HasDFlashWeights();
+        // lookup 是第三草稿后端:零草稿权重、纯 token 空间。优先级
+        // dflash > mtp > lookup;同时高于 GPU token handoff(handoff 消费
+        // 分支先于 MTP 分支且可自链,会饿死 lookup 探测)。
+        bool useLookupScheduler = Qwen35LookupDraftsPerStep() > 0 &&
+                                  !useDFlashScheduler && !useMtpScheduler;
+        if (Qwen35LookupDraftsPerStep() > 0 && !useLookupScheduler) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                printf("[Qwen3.5 Lookup] disabled: another draft backend takes "
+                       "precedence (dflash > mtp > lookup).\n");
+                fflush(stdout);
+            }
+        }
+        if (useLookupScheduler) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                printf("[Qwen3.5 Lookup] scheduler enabled: lookup_draft_max=%d.\n",
+                       Qwen35LookupDraftsPerStep());
+                fflush(stdout);
+            }
+        }
         std::vector<int> handoffDevices;
         std::map<int, int> handoffRatios;
-        bool useGpuTokenHandoffScheduler = Qwen35MtpDisabledByEnv() &&
+        bool useGpuTokenHandoffScheduler = !useLookupScheduler &&
+            Qwen35MtpDisabledByEnv() &&
             Qwen35GpuTokenHandoffEnabled() &&
             GetCudaEmbeddingRequested() && !GetLowMemMode() &&
             GetQwen35GPUForwardDevices(this->deviceMap, handoffDevices,
@@ -10163,7 +10253,7 @@ namespace fastllm {
             !handoffDevices.empty();
         return CanUseGPUForward() &&
                (useMtpScheduler || useDFlashScheduler ||
-                useGpuTokenHandoffScheduler);
+                useLookupScheduler || useGpuTokenHandoffScheduler);
 #endif
     }
 
@@ -17316,7 +17406,11 @@ namespace fastllm {
         const bool useDFlash = HasDFlashWeights();
         const bool useMtp = !useDFlash && !Qwen35MtpDisabledByEnv() &&
                             HasMtpWeights();
-        if (!useDFlash && !useMtp) {
+        // 第三草稿后端:prompt-lookup 不要求 MTP 权重、不触发草稿缓存
+        // seeding 检查;与 useDFlash/useMtp 互斥(优先级 dflash > mtp > lookup)。
+        const bool useLookup = !useDFlash && !useMtp &&
+                               Qwen35LookupDraftsPerStep() > 0;
+        if (!useDFlash && !useMtp && !useLookup) {
             return false;
         }
 
@@ -17351,7 +17445,7 @@ namespace fastllm {
             logMtpSkip("generation config is unsupported");
             return false;
         }
-        if (!useDFlash && !HasMtpWeights()) {
+        if (!useDFlash && !useLookup && !HasMtpWeights()) {
             logMtpSkip("MTP weights were not found");
             return false;
         }
@@ -17367,17 +17461,40 @@ namespace fastllm {
         std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
         MtpKvCache &mtpCache = mtpCaches[context];
         DFlashContext &dflashContext = dflashContexts[context];
+        LookupDraftState *lookupState = useLookup ? &lookupStates[context] : nullptr;
+        if (useLookup) {
+            if (lookupState->paused) {
+                // 停发期:不产草稿,return false 走普通 ForwardGPU(graph 命中)。
+                // 每 PROBE_INTERVAL 个发布 token 探测恢复;恢复即窗口双清零。
+                size_t elapsed = context->allTokens.size() > lookupState->allTokensAtPause ?
+                    context->allTokens.size() - lookupState->allTokensAtPause : 0;
+                if (elapsed >= (size_t)Qwen35LookupProbeInterval()) {
+                    lookupState->paused = false;
+                    lookupState->windowAttempts = 0;
+                    lookupState->windowAccepts = 0;
+                    lookupState->windowTokens = 0;
+                } else {
+                    return false;
+                }
+            }
+            // 惰性对齐:lookup 无 KV 侧草稿状态,committedTokens 恒可由
+            // cacheLen + preTokens - seqLens 恢复——统一覆盖 fallback 回退、
+            // releaseAndReinit 重放、暂停期错位等一切场景,无需跳步或擦除。
+            int lookupExpected = context->cacheLen + context->preTokens - seqLens[0];
+            lookupState->committedTokens = std::max(0, lookupExpected);
+        }
         auto eraseDraftCache = [&]() {
             mtpCaches.erase(context);
             dflashContexts.erase(context);
         };
         int activeCacheTokens = useDFlash ?
-            dflashContext.committedTokens : mtpCache.tokens;
-        if (context->cacheLen > 0 && activeCacheTokens == 0) {
+            dflashContext.committedTokens :
+            (useLookup ? lookupState->committedTokens : mtpCache.tokens);
+        if (!useLookup && context->cacheLen > 0 && activeCacheTokens == 0) {
             logMtpSkip("prefix cache hit without speculative draft cache");
             return false;
         }
-        if (activeCacheTokens == 0 && context->preTokens > seqLens[0]) {
+        if (!useLookup && activeCacheTokens == 0 && context->preTokens > seqLens[0]) {
             logMtpSkip("draft cache was not seeded during prefill");
             return false;
         }
@@ -17418,11 +17535,25 @@ namespace fastllm {
         bool tensorParallel = devices.size() > 1;
         const int logInterval = QWEN35_MTP_LOG_INTERVAL;
         int mtpDraftsPerStep = useDFlash ? DFlashDraftsPerStep() :
-                                           Qwen35MtpDraftsPerStep();
+            (useLookup ? Qwen35LookupDraftsPerStep() :
+                         Qwen35MtpDraftsPerStep());
         if (mtpDraftsPerStep <= 0) {
             return false;
         }
-        if (!mtpLogPrinted.exchange(true)) {
+        if (useLookup && !mtpLogPrinted.exchange(true)) {
+            fastllm::PromptLookupIndex::Config lookupConfig =
+                Qwen35LookupIndexConfig();
+            printf("[Qwen3.5 Lookup] enabled: drafts_per_step=%d, ngram=[%d,%d], "
+                   "max_entries=%zu, root_device=cuda:%d, tp_devices=%zu, "
+                   "acceptance=exact(greedy), pause_window=%d, "
+                   "probe_interval=%d, pause_threshold=%.2f, log_interval=%d validations.\n",
+                   mtpDraftsPerStep, lookupConfig.ngramMin, lookupConfig.ngramMax,
+                   lookupConfig.maxEntries, device, devices.size(),
+                   Qwen35LookupPauseWindow(), Qwen35LookupProbeInterval(),
+                   Qwen35LookupPauseThreshold(), logInterval);
+            fflush(stdout);
+        }
+        if (!useLookup && !mtpLogPrinted.exchange(true)) {
             const char *acceptance = useDFlash ?
                 "exact(greedy)/rejection(selector_q,target_p)(sampling)" :
                 "exact(greedy)/typical(posterior_threshold=0.09, posterior_alpha=0.30)(sampling)";
@@ -17443,7 +17574,7 @@ namespace fastllm {
                 return;
             }
             printf("[Qwen3.5 %s] pos_accept_rate=[",
-                   useDFlash ? "DFlash2" : "MTP");
+                   useDFlash ? "DFlash2" : (useLookup ? "Lookup" : "MTP"));
             for (int i = 0; i < mtpDraftsPerStep; i++) {
                 long long attempts =
                     mtpDraftPositionAttempts[i].load(std::memory_order_relaxed);
@@ -17453,7 +17584,15 @@ namespace fastllm {
                     (double)accepts * 100.0 / (double)attempts : 0.0;
                 printf("%s%.2f%%", i == 0 ? "" : ", ", rate);
             }
-            printf("].\n");
+            printf("].");
+            if (useLookup) {
+                long long probes = gLookupProbeCount.load(std::memory_order_relaxed);
+                long long hits = gLookupHitCount.load(std::memory_order_relaxed);
+                double hitRate = probes > 0 ?
+                    (double)hits * 100.0 / (double)probes : 0.0;
+                printf(" hit_rate=%.2f%%(%lld/%lld).", hitRate, hits, probes);
+            }
+            printf("\n");
             fflush(stdout);
         };
 
@@ -18386,6 +18525,9 @@ namespace fastllm {
             nextInputTokens[0].push_back(firstToken);
             nextInputTokens[0].insert(nextInputTokens[0].end(), drafts.begin(), drafts.end());
         };
+        // 声明提升:草稿链 lambda(按引用捕获)需要读取验证步判定结果,
+        // 而该结果在下方进入种子/验证分支前才计算。调用点全部晚于赋值。
+        bool isSpeculativeValidation = false;
         // The verifier below is shared.  Keep the two draft generators as
         // separate concrete backends so changes to DFlash cannot perturb the
         // established MTP draft chain.
@@ -18465,6 +18607,72 @@ namespace fastllm {
             mtpProfileAddSpan(mtpProfileDraftFirstUs, draftStart);
             return drafts;
         };
+        // prompt-lookup 草稿链:查表替代草稿模型。committedTokens 语义与
+        // 两个既有后端对齐——种子步 = {nextToken},验证步 = committedRet
+        // (前 publishLen 个即本步待发布 token,锚点不在内)。
+        auto runLookupDraftChain = [&](const std::vector<int> &draftInputTokens,
+                                       const std::vector<int> &committedTokens) {
+            LookupDraftState &st = *lookupState;
+            if (!st.index) {
+                st.index = std::make_unique<fastllm::PromptLookupIndex>(
+                    Qwen35LookupIndexConfig());
+            }
+            // 增量喂索引:源 = 已发布 token(allTokens 差量)。本步待发布
+            // 前缀此刻尚未进 allTokens,留给下一步差量补入,避免双计。
+            if (st.indexedLen < context->allTokens.size()) {
+                st.index->Append(std::vector<int>(
+                    context->allTokens.begin() + st.indexedLen,
+                    context->allTokens.end()));
+                st.indexedLen = context->allTokens.size();
+            }
+            // 已提交计数:种子步提交 seqLen 个、验证步提交 commitLen 个,
+            // 两者都等于 draftInputTokens.size()(入口处 resync 已把
+            // st.committedTokens 对齐到本步入口期望值)。
+            st.committedTokens += (int)draftInputTokens.size();
+            // 自适应滑窗结算(per-token 口径);窗口满即判定,停发与
+            // 窗口滚动都清零计数。
+            const int publishLen = isSpeculativeValidation ?
+                (int)draftInputTokens.size() : 1;
+            st.windowTokens += publishLen;
+            if (isSpeculativeValidation) {
+                st.windowAttempts += seqLen - 1;
+                st.windowAccepts += publishLen - 1;
+            }
+            if (st.windowTokens >= Qwen35LookupPauseWindow()) {
+                double rate = st.windowAttempts > 0 ?
+                    (double)st.windowAccepts / (double)st.windowAttempts : 0.0;
+                if (rate < Qwen35LookupPauseThreshold()) {
+                    st.paused = true;
+                    st.allTokensAtPause = context->allTokens.size();
+                }
+                st.windowAttempts = 0;
+                st.windowAccepts = 0;
+                st.windowTokens = 0;
+            }
+            if (st.paused) {
+                return std::vector<int>();
+            }
+            // 查询尾 = allTokens 尾 + 本步待发布前缀,按序拼接;
+            // 多给上下文无害(引擎只取尾部 ngramMax 个作 key)。
+            const int kLookupTailContext = 32;
+            size_t takePublished = std::min<size_t>(
+                (size_t)publishLen, committedTokens.size());
+            int takeFromAll = std::max(0, kLookupTailContext - (int)takePublished);
+            size_t allStart = (size_t)takeFromAll < context->allTokens.size() ?
+                context->allTokens.size() - (size_t)takeFromAll : 0;
+            std::vector<int> recent(
+                context->allTokens.begin() + allStart,
+                context->allTokens.end());
+            recent.insert(recent.end(),
+                          committedTokens.begin(),
+                          committedTokens.begin() + takePublished);
+            std::vector<int> drafts = st.index->Lookup(recent, mtpDraftsPerStep);
+            gLookupProbeCount.fetch_add(1, std::memory_order_relaxed);
+            if (!drafts.empty()) {
+                gLookupHitCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            return drafts;
+        };
         auto runSpeculativeDraftChain = [&](const Data &targetHiddenStates,
                                             const std::vector<int> &draftInputTokens,
                                             const Data &draftPositionIds,
@@ -18476,6 +18684,9 @@ namespace fastllm {
                     targetHiddenStates, draftInputTokens, draftPositionIds,
                     sampleRow, lastPositionRow, committedTokens);
             }
+            if (useLookup) {
+                return runLookupDraftChain(draftInputTokens, committedTokens);
+            }
             return runMtpDraftChain(
                 targetHiddenStates, draftInputTokens, draftPositionIds,
                 sampleRow, lastPositionRow);
@@ -18483,7 +18694,7 @@ namespace fastllm {
 
         mtpProfileMark(mtpProfileSetupUs);
         std::vector<int> targetRet;
-        bool isSpeculativeValidation =
+        isSpeculativeValidation =
             seqLen >= 2 && seqLen <= mtpDraftsPerStep + 1 &&
             activeCacheTokens > 0 && context->preTokens > seqLen;
         if (!isSpeculativeValidation) {
@@ -21312,8 +21523,17 @@ namespace fastllm {
         int pageLen = fastllm::GetPageLen();
 
         const bool schedulerUsesDFlash = model->HasDFlashWeights();
+        const bool schedulerMtpUsable = !Qwen35MtpDisabledByEnv() &&
+                                        model->HasMtpWeights();
+        // lookup 单后端单通道:优先级 dflash > mtp > lookup,与
+        // Qwen35MTPForward 门控的 useLookup 判定保持一致。
+        const bool schedulerUsesLookup = !schedulerUsesDFlash &&
+                                         !schedulerMtpUsable &&
+                                         Qwen35LookupDraftsPerStep() > 0;
         const int mtpDraftsPerStep = schedulerUsesDFlash ?
-            model->DFlashDraftsPerStep() : Qwen35MtpDraftsPerStep();
+            model->DFlashDraftsPerStep() :
+            (schedulerUsesLookup ? Qwen35LookupDraftsPerStep() :
+                                   Qwen35MtpDraftsPerStep());
         const bool canUseMtpBatchForward =
             schedulerUsesDFlash ?
                 model->CanUseQwen35DFlashBatchForward(mtpDraftsPerStep) :
@@ -22064,7 +22284,8 @@ namespace fastllm {
         bool gpuTokenHandoffCudaEmbedding = GetCudaEmbeddingRequested();
         bool gpuTokenHandoffLowMem = GetLowMemMode();
         bool gpuTokenHandoffMtpDisabled =
-            Qwen35MtpDisabledByEnv() && !schedulerUsesDFlash;
+            Qwen35MtpDisabledByEnv() && !schedulerUsesDFlash &&
+            !schedulerUsesLookup;
         bool gpuTokenHandoffHasDevices = GetQwen35GPUForwardDevices(
             model->deviceMap, gpuTokenHandoffDevices,
             gpuTokenHandoffRatios);
