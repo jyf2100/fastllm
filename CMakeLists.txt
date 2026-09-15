@@ -208,7 +208,7 @@ file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 # Large model units should start alongside CUDA templates rather than after
 # all CUDA jobs have been queued. Keep them out of FASTLLM_CXX_SOURCES below.
 set(FASTLLM_LARGE_MODEL_SOURCES src/models/qwen3_5.cpp)
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp src/prompt_lookup.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
@@ -1305,6 +1305,10 @@ if (UNIT_TEST)
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         endif()
     endif()
+    # prompt-lookup 引擎单测:刻意不链接 fastllm,证明引擎无模型依赖。
+    add_executable(prompt_lookup_test test/basic/test_prompt_lookup.cpp src/prompt_lookup.cpp)
+    target_include_directories(prompt_lookup_test PRIVATE include)
+    add_test(NAME prompt_lookup COMMAND prompt_lookup_test)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)

@@ -6,6 +6,7 @@
 #define FASTLLM_QWEN3_5_H
 #include "basellm.h"
 #include "cmath"
+#include "prompt_lookup.h"
 #include "utils/persistent_worker_group.h"
 #include "utils/image_embedding_cache.h"
 
@@ -345,6 +346,22 @@ namespace fastllm {
         std::vector<int> speculativeFirstTokenLinearCaptureMask;
         mutable std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
         mutable std::unordered_map<ResponseContext*, DFlashContext> dflashContexts;
+        // prompt-lookup 第三草稿后端的每请求状态。索引是纯 token 空间:
+        // 不依赖 KV/草稿权重,前缀缓存命中、fallback、releaseAndReinit 后
+        // 都能从 allTokens 惰性重建,因此刻意不进 eraseMtpCache/回退路径,
+        // 仅随 OnResponseContextCreated/Removed 与请求结束清生命周期。
+        struct LookupDraftState {
+            std::unique_ptr<fastllm::PromptLookupIndex> index; // 惰性构造(env 配置)
+            size_t indexedLen = 0;      // 已喂入索引的源 token 数(已发布口径)
+            int committedTokens = 0;    // 已提交进目标 KV 的 token 数(对齐口径)
+            // 自适应停发:每请求滑窗,per-token 口径;停发与恢复双清零。
+            long long windowAttempts = 0;
+            long long windowAccepts = 0;
+            long long windowTokens = 0;
+            size_t allTokensAtPause = 0;
+            bool paused = false;
+        };
+        mutable std::unordered_map<ResponseContext*, LookupDraftState> lookupStates;
         mutable std::mutex mtpCacheMutex;
         std::atomic<bool> mtpLogPrinted{false};
         std::atomic<bool> mtpSkipLogPrinted{false};
