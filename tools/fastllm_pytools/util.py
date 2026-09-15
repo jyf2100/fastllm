@@ -476,6 +476,23 @@ def apply_image_embedding_cache_env(args):
     if capacity is not None:
         os.environ["FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES"] = str(_memory_size_bytes(capacity))
 
+def apply_vision_device_env(args):
+    device = getattr(args, "vision_device", None)
+    if device is None:
+        device = os.environ.get("FASTLLM_QWEN35_VISION_DEVICE", "auto")
+    os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = _vision_device(device)
+
+
+def _vision_device(value):
+    device = str(value).strip().lower() or "auto"
+    if device in ("auto", "cpu", "cuda"):
+        return device
+    if device.startswith("cuda:"):
+        index = device[5:]
+        if index and index.isascii() and index.isdecimal() and int(index) <= 2147483647:
+            return "cuda:" + str(int(index))
+    raise argparse.ArgumentTypeError("vision device must be auto, cpu, cuda, or cuda:N (N >= 0)")
+
 
 def apply_prefix_cache_env(args):
     prefix_cache = getattr(args, "prefix_cache", "")
@@ -732,6 +749,7 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "MiniMaxM1ForCausalLM",
@@ -751,17 +769,22 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Dots3NoteForCausalLM",
         "Glm5NextForConditionalGeneration",
     ] or model_type in [
-        "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
+        "deepseek_v4", "deepseek_v41", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
         "kimi_k3", "dots3_note", "glm5_next", "glm5_next_text", "qwen4_exp",
         "qwen3_8_flash_next",
     ] or text_model_type in [
-        "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
+        "deepseek_v41_text", "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
         "qwen3_8_flash_next_text",
     ])
 
-def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
-    return (architecture == "DeepseekV4ForCausalLM" or
-            model_type == "deepseek_v4")
+def _prefers_multicuda_tp(architecture: str, model_type: str = "",
+                          text_model_type: str = "") -> bool:
+    # DeepSeek-V4.1 与 V4 共用同一套 multicuda 张量并行实现（注意力按 query head
+    # 切分 + wo_b 列切 all-reduce），--tp N 同样要落到 multicuda 执行器上。
+    return (architecture in ("DeepseekV4ForCausalLM",
+                             "DeepseekV41ForCausalLM") or
+            model_type in ("deepseek_v4", "deepseek_v41") or
+            text_model_type == "deepseek_v41_text")
 
 def _prefers_laguna_hybrid_tp(architecture: str, model_type: str = "") -> bool:
     return (architecture == "LagunaForCausalLM" or
@@ -779,12 +802,15 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA）')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
+    parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
+                        type = _vision_device, default = None,
+                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N (默认 auto, 即首个前向 GPU)')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
@@ -1183,6 +1209,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
+    is_deepseek_v41_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
     is_qwen35_model = False
@@ -1232,6 +1259,17 @@ def make_normal_llm_model(args, startup_progress = None):
                     "family (Qwen3.5 / Qwen3.5-MoE); found architecture=%s "
                     "model_type=%s" %
                     (architecture or "unknown", model_type or "unknown"))
+            # DeepSeek-V4.1 的内置 DSpark 草稿层同样存放在 mtp.*，但配置在 text_config 里，
+            # 且运行时的 block 可以小于 checkpoint 的训练 block（每轮少校验几个候选）
+            is_deepseek_v41_model = (
+                architecture in ("DeepseekV41ForCausalLM",
+                                 "DeepSeekV41ForCausalLM") or
+                model_type == "deepseek_v41" or
+                text_model_type == "deepseek_v41_text"
+            )
+            dspark_config = config
+            if is_deepseek_v41_model and isinstance(config.get("text_config"), dict):
+                dspark_config = config["text_config"]
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -1241,22 +1279,28 @@ def make_normal_llm_model(args, startup_progress = None):
                             "Kimi-K3, got architecture=%s model_type=%s" %
                             (architecture, model_type))
                 else:
-                    if not is_deepseek_v4_model:
+                    if not (is_deepseek_v4_model or is_deepseek_v41_model):
                         raise ValueError(
-                            "Embedded DSpark requires a DeepSeek-V4 checkpoint with "
+                            "Embedded DSpark requires a DeepSeek-V4 / V4.1 checkpoint with "
                             "embedded mtp.* DSpark weights, got architecture=%s "
                             "model_type=%s" % (architecture, model_type))
-                    checkpoint_block = int(config.get(
+                    checkpoint_block = int(dspark_config.get(
                         "dspark_block_size", 0) or 0)
-                    target_layers = config.get("dspark_target_layer_ids", [])
-                    noise_token = int(config.get(
+                    target_layers = dspark_config.get("dspark_target_layer_ids", [])
+                    noise_token = int(dspark_config.get(
                         "dspark_noise_token_id", -1) or -1)
                     if (checkpoint_block <= 0 or not target_layers or
                             noise_token < 0):
                         raise ValueError(
                             "DeepSeek-V4 checkpoint is missing embedded DSpark "
                             "configuration")
-                    if dspark_tokens < checkpoint_block:
+                    if is_deepseek_v41_model:
+                        if not 1 <= dspark_tokens <= checkpoint_block:
+                            raise ValueError(
+                                "DeepSeek-V4.1 DSpark draft tokens must be in "
+                                "[1, checkpoint block size] (requested=%d, checkpoint=%d)" %
+                                (dspark_tokens, checkpoint_block))
+                    elif dspark_tokens < checkpoint_block:
                         raise ValueError(
                             "DSpark draft tokens must be at least the checkpoint training "
                             "block size (requested=%d, checkpoint=%d)" %
@@ -1376,8 +1420,12 @@ def make_normal_llm_model(args, startup_progress = None):
                 is_thread_tp_moe_model = True
             if (_prefers_laguna_hybrid_tp(architecture, model_type)):
                 is_laguna_hybrid_tp_model = True
-            if (_prefers_multicuda_tp(architecture, model_type)):
+            if (_prefers_multicuda_tp(architecture, model_type, text_model_type)):
                 is_multicuda_tp_model = True
+            if (architecture == 'DeepseekV41ForCausalLM' or
+                    model_type == 'deepseek_v41' or
+                    text_model_type == 'deepseek_v41_text'):
+                is_deepseek_v41_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
@@ -1522,7 +1570,9 @@ def make_normal_llm_model(args, startup_progress = None):
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
-            if (atype_was_auto):
+            if (atype_was_auto and not is_deepseek_v41_model):
+                # DeepSeek-V4.1 的 SetDataType 只接受 float32（推理精度由模型内部
+                # 自己按 BF16 走），--tp 不能像其它模型那样把 atype 改成 float16。
                 args.atype = "bfloat16" if is_laguna_model else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
@@ -1605,6 +1655,7 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.set_page_size(args.page_size)
     apply_prefix_cache_env(args)
     apply_image_embedding_cache_env(args)
+    apply_vision_device_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):

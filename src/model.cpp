@@ -37,6 +37,7 @@
 #include "hunyuan.h"
 #include "deepseekv2.h"
 #include "deepseekv4.h"
+#include "deepseekv41.h"
 #include "dots3_note.h"
 #include "glm5_moe_dsa.h"
 #include "glm5_next.h"
@@ -640,6 +641,7 @@ namespace fastllm {
              model->model_type != "laguna" &&
              model->model_type != "minimax_m2" &&
              model->model_type != "deepseek_v4" &&
+             model->model_type != "deepseek_v41" &&
              model->model_struct != "qwen3_5") ||
             !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
@@ -655,8 +657,11 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        // DeepSeek-V4.1 继承 DeepSeekV4Model，注意力权重的切分单位（o_groups 对齐）
+        // 与 V4 完全一致，直接复用同一套 split unit。
         const DeepSeekV4Model *deepseekV4 =
-            model->model_type == "deepseek_v4" ?
+            (model->model_type == "deepseek_v4" ||
+             model->model_type == "deepseek_v41") ?
                 dynamic_cast<const DeepSeekV4Model*>(model) : nullptr;
         if (deepseekV4 != nullptr) {
             if (weightName.find(".attn.wq_b.weight") !=
@@ -721,7 +726,8 @@ namespace fastllm {
             model->model_struct == "qwen3_5" &&
             weightName.find(".mlp.experts.") != std::string::npos &&
             data.dataType == DataType::INT4_GROUP;
-        if (model->model_type == "deepseek_v4" && routedExpert >= 0 &&
+        if ((model->model_type == "deepseek_v4" ||
+             model->model_type == "deepseek_v41") && routedExpert >= 0 &&
             !deepSeekV4TensorParallelExperts) {
             constexpr int ownerOffset = 0;
             int ownerCount = (int)devices.size();
@@ -1128,6 +1134,8 @@ namespace fastllm {
             model->model_type = modelType;
         } else if (modelType == "deepseek_v4") {
             model = (basellm*)(new DeepSeekV4Model());
+        } else if (modelType == "deepseek_v41" || modelType == "deepseek_v41_text") {
+            model = (basellm*)(new DeepSeekV41Model());
             model->model_type = modelType;
         } else if (modelType == "dots3_note") {
             model = (basellm*)(new Dots3NoteModel());
@@ -4930,6 +4938,8 @@ namespace fastllm {
         if (model->YarnConfig() && (!dsparkPath.empty() || !dflashPath.empty())) {
             throw std::invalid_argument("Context extension with an external DSpark/DFlash draft is not implemented; disable the external draft.");
         }
+        // 记录模型目录，供需要自行读取超大张量的模型（如 DeepSeek-V4.1 Engram 表）使用
+        model->weight.AddDict("model_directory", path);
         model->InitParams();
         if (model->contextPlan.configured) model->max_positions = model->contextPlan.effectiveLength;
 

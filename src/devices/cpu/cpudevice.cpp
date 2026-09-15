@@ -4,11 +4,13 @@
 
 #define _USE_MATH_DEFINES
 #include "devices/cpu/cpudevice.h"
+#include "devices/cpu/deepseekv41-reference-math.h"
 #include "executor.h"
 #include "devices/cpu/computeutils.h"
 #include "devices/cpu/kimi_k3_ops.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 
@@ -34,7 +36,9 @@
 #include "gguf.h"
 
 namespace fastllm {
+    extern CPUInstructInfo cpuInstructInfo;
     void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
+    void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len);
     extern bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len);
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
@@ -61,7 +65,7 @@ namespace fastllm {
         float *gateUpData;
         float *swigluData;
         uint16_t *downInputData;
-        int mid, st, end;
+        int mid, st, end, quantBlock;
         bool routed, computeActivation, quantize, convert;
         float routeWeight, swigluLimit;
 
@@ -69,10 +73,10 @@ namespace fastllm {
             float *gateUpData, float *swigluData, uint16_t *downInputData,
             int mid, int st, int end, bool routed, float routeWeight,
             float swigluLimit, bool computeActivation, bool quantize,
-            bool convert
+            bool convert, int quantBlock = 128
         ) : gateUpData(gateUpData), swigluData(swigluData),
             downInputData(downInputData), mid(mid), st(st), end(end),
-            routed(routed), computeActivation(computeActivation),
+            quantBlock(quantBlock), routed(routed), computeActivation(computeActivation),
             quantize(quantize), convert(convert), routeWeight(routeWeight),
             swigluLimit(swigluLimit) {}
 
@@ -85,14 +89,15 @@ namespace fastllm {
                         gate = std::min(gate, swigluLimit);
                         up = std::max(-swigluLimit, std::min(up, swigluLimit));
                     }
-                    float h = (gate / (1.0f + std::exp(-gate))) * up;
+                    float exponent = quantBlock == 32 && V41ReferenceMathEnabled() ? V41CPUMath().Exp(-gate) : std::exp(-gate);
+                    float h = (gate / (1.0f + exponent)) * up;
                     swigluData[i] = RoundFloat32ToBFloat16RNE(routeWeight * h);
                 }
             }
             if (quantize) {
                 // Tasks are block-128 aligned, so quantizing a task at a time
                 // preserves the official per-block activation scales exactly.
-                QuantizeDequantizeFP8E4M3Block128(swigluData + st, end - st);
+                QuantizeDequantizeFP8E4M3Blocks(swigluData + st, end - st, quantBlock);
             }
             if (convert) {
                 Float32ToBFloat16(swigluData + st, downInputData + st, end - st);
@@ -238,14 +243,32 @@ namespace fastllm {
         }
     }
 
+    // Mixed expert checkpoints may keep shared weights in FP16. Do not
+    // silently omit them from the BF16-activation task queue.
+    struct MultiThreadMoeBFloat16Float16Op : MultiThreadBaseOp {
+        uint16_t *input, *weight;
+        float *output;
+        int columns, rows, start, end;
+        MultiThreadMoeBFloat16Float16Op(uint16_t *input, uint16_t *weight, float *output,
+                                      int columns, int rows, int start, int end)
+            : input(input), weight(weight), output(output), columns(columns), rows(rows), start(start), end(end) {}
+        void Run() override {
+            std::vector<float> values(columns);
+            for (int i = 0; i < columns; i++) values[i] = BFloat16BitsToFloat32(input[i]);
+            MultiThreadLinearFloat32Float16Op(values.data(), weight, nullptr, output,
+                                             1, columns, rows, start, end).Run();
+        }
+    };
+
     struct DeepSeekV4MoeLinearTaskStorage {
         std::vector<MultiThreadLinearBFloat16FP8E4M3Op> fp8;
         std::vector<MultiThreadLinearBFloat16NVFP4Op> nvfp4;
         std::vector<MultiThreadLinearBFloat16BFloat16Op> bf16;
+        std::vector<MultiThreadMoeBFloat16Float16Op> fp16;
 
         void BuildPointers(std::vector<MultiThreadBaseOp*> &tasks) {
             tasks.clear();
-            tasks.reserve(fp8.size() + nvfp4.size() + bf16.size());
+            tasks.reserve(fp8.size() + nvfp4.size() + bf16.size() + fp16.size());
             // FP8 rows carry roughly twice as many weight bytes as compact
             // NVFP4 rows. Queue the heavier shared-expert work first so it
             // cannot become a half-populated final wave.
@@ -258,33 +281,41 @@ namespace fastllm {
             for (auto &task : bf16) {
                 tasks.push_back(&task);
             }
+            for (auto &task : fp16) {
+                tasks.push_back(&task);
+            }
         }
     };
 
     static void AppendDeepSeekV4MoeLinearTasks(
         DeepSeekV4MoeLinearTaskStorage &tasks, uint16_t *linearInput,
         Data &weight, float *linearOutput, int inputColumns, int outputRows,
-        int rowsPerTask
+        int rowsPerTask, int tokens = 1
     ) {
         for (int st = 0; st < outputRows; st += rowsPerTask) {
             int end = std::min(st + rowsPerTask, outputRows);
             if (weight.dataType == DataType::FP8_E4M3) {
                 tasks.fp8.emplace_back(
                     linearInput, weight.cpuData, nullptr, linearOutput,
-                    1, inputColumns, outputRows, st, end,
+                    tokens, inputColumns, outputRows, st, end,
                     weight.scales.data(), weight.blockK, weight.blockM);
             } else if (weight.dataType == DataType::NVFP4) {
                 float *scaleFloats =
                     weight.scales.empty() ? nullptr : weight.scales.data();
                 tasks.nvfp4.emplace_back(
                     linearInput, weight.cpuData, nullptr, linearOutput,
-                    1, inputColumns, outputRows, st, end,
+                    tokens, inputColumns, outputRows, st, end,
                     scaleFloats, GetNVFP4ScaleData(weight),
                     weight.blockK, weight.blockM);
             } else if (weight.dataType == DataType::BFLOAT16) {
                 tasks.bf16.emplace_back(
                     linearInput, (uint16_t*)weight.cpuData, nullptr,
                     linearOutput, 1, inputColumns, outputRows, st, end);
+            } else if (weight.dataType == DataType::FLOAT16) {
+                tasks.fp16.emplace_back(linearInput, (uint16_t*)weight.cpuData, linearOutput,
+                                        inputColumns, outputRows, st, end);
+            } else {
+                ErrorInFastLLM("Unsupported weight dtype in DeepSeek CPU MoE task.\n");
             }
         }
     }
@@ -294,7 +325,7 @@ namespace fastllm {
         const std::vector<std::pair<int, float>> &experts,
         Data **weights, int weightOffset, int rowsPerTask
     ) {
-        size_t fp8Count = 0, nvfp4Count = 0, bf16Count = 0;
+        size_t fp8Count = 0, nvfp4Count = 0, bf16Count = 0, fp16Count = 0;
         for (const auto &expert : experts) {
             Data &weight = *weights[expert.first * 2 + weightOffset];
             size_t taskCount =
@@ -305,11 +336,151 @@ namespace fastllm {
                 nvfp4Count += taskCount;
             } else if (weight.dataType == DataType::BFLOAT16) {
                 bf16Count += taskCount;
+            } else if (weight.dataType == DataType::FLOAT16) {
+                fp16Count += taskCount;
             }
         }
         tasks.fp8.reserve(fp8Count);
         tasks.nvfp4.reserve(nvfp4Count);
         tasks.bf16.reserve(bf16Count);
+        tasks.fp16.reserve(fp16Count);
+    }
+
+    struct MultiThreadV41MoePrefillInputOp : MultiThreadBaseOp {
+        uint16_t *original, *quantized;
+        int dim, start, end;
+        MultiThreadV41MoePrefillInputOp(uint16_t *original, uint16_t *quantized, int dim, int start, int end)
+            : original(original), quantized(quantized), dim(dim), start(start), end(end) {}
+        void Run() override {
+            std::vector<float> row(dim);
+            for (int token = start; token < end; ++token) {
+                BFloat16ToFloat32(original + size_t(token)*dim, row.data(), dim);
+                QuantizeDequantizeFP8E4M3Blocks(row.data(), dim, 32);
+                Float32ToBFloat16(row.data(), quantized + size_t(token)*dim, dim);
+            }
+        }
+    };
+
+    struct MultiThreadV41MoePrefillReduceOp : MultiThreadBaseOp {
+        const float *down;
+        const int *order;
+        uint16_t *output;
+        int dim, selected, start, end;
+        MultiThreadV41MoePrefillReduceOp(const float *down, const int *order, uint16_t *output,
+                                       int dim, int selected, int start, int end)
+            : down(down), order(order), output(output), dim(dim), selected(selected), start(start), end(end) {}
+        void Run() override {
+            std::vector<float> row(dim);
+            for (int token = start; token < end; ++token) {
+                std::fill(row.begin(), row.end(), 0.0f);
+                // Tokens are independent; keep each token's original expert order.
+                for (int j = 0; j < selected; ++j) {
+                    const float *result = down + size_t(order[token*selected+j])*dim;
+                    for (int d = 0; d < dim; ++d) row[d] += RoundFloat32ToBFloat16RNE(result[d]);
+                }
+                uint16_t *dst = output + size_t(token)*dim;
+                for (int d = 0; d < dim; ++d) dst[d] = Float32ToBFloat16RNEBits(row[d]);
+            }
+        }
+    };
+
+    static bool TryV41MoePrefill(Data &input, Data &output, Data **weights,
+            int expertCount, int topk, const int32_t *indices, const float *scores,
+            float swigluLimit, bool quantizeShared) {
+        const int n = input.dims[0], dim = input.dims[1];
+        if (n < 2 || n > 512 || dim%32 || output.dataType != DataType::BFLOAT16 ||
+            !cpuInstructInfo.hasAVX512BF16 || std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST") ||
+            std::getenv("FASTLLM_DSV41_DISABLE_BATCHED_MOE")) return false;
+        const bool shared = weights[0] != nullptr;
+        const int selected = topk+int(shared), mid = weights[2]->dims[0]/2;
+        if (mid%32) return false;
+        for (int expert = shared ? 0 : 1; expert <= expertCount; ++expert) {
+            for (int part = 0; part < 2; ++part) {
+                Data *w = weights[expert*2+part];
+                if (!w || w->dims != (part ? std::vector<int>{dim,mid} : std::vector<int>{mid*2,dim}) ||
+                    w->blockM != 32 || (w->dataType != DataType::FP8_E4M3 && w->dataType != DataType::NVFP4)) return false;
+            }
+        }
+        // Group token/expert assignments for weight reuse, but retain an
+        // explicit inverse permutation for the original per-token reduction.
+        struct Route { int token, order; float scale; };
+        std::vector<std::vector<Route>> routes(expertCount+1);
+        for (int token = 0; token < n; ++token) {
+            std::vector<std::pair<int,float>> chosen;
+            for (int j = 0; j < topk; ++j)
+                chosen.emplace_back(std::max(0,std::min(int(indices[token*topk+j]),expertCount-1))+1,scores[token*topk+j]);
+            std::stable_sort(chosen.begin(),chosen.end(),[](const auto &a,const auto &b){return a.first<b.first;});
+            if (shared) chosen.emplace_back(0,1.0f);
+            for (int j = 0; j < selected; ++j)
+                routes[chosen[j].first].push_back({token,token*selected+j,chosen[j].second});
+        }
+        std::vector<uint16_t> original(size_t(n)*dim), quantized(original.size());
+        if (input.dataType == DataType::BFLOAT16)
+            memcpy(original.data(),input.cpuData,original.size()*sizeof(uint16_t));
+        else Float32ToBFloat16((float *)input.cpuData,original.data(),original.size());
+        // Small prompts cost less than the additional thread-pool round trips.
+        const bool parallelRows = n >= 256 && !V41ReferenceMathEnabled() &&
+            std::getenv("FASTLLM_DSV41_DISABLE_PARALLEL_MOE_ROWS") == nullptr;
+        const int rowsPerTask = parallelRows ? 8 : n;
+        std::vector<MultiThreadV41MoePrefillInputOp> inputTasks;
+        for (int first = 0; first < n; first += rowsPerTask)
+            inputTasks.emplace_back(original.data(),quantized.data(),dim,first,std::min(first+rowsPerTask,n));
+        std::vector<MultiThreadBaseOp*> tasks;
+        for (auto &task : inputTasks) tasks.push_back(&task);
+        if (parallelRows) ScheduleDeepSeekV4MoeTasks(tasks,false);
+        else inputTasks[0].Run();
+        const size_t count = size_t(n)*selected;
+        std::vector<uint16_t> packed(count*dim), downInput(count*mid);
+        std::vector<float> gate(count*mid*2), activation(count*mid), down(count*dim);
+        std::vector<int> order(count), begins(expertCount+2);
+        size_t slot = 0;
+        for (int expert = 0; expert <= expertCount; ++expert) {
+            begins[expert] = slot;
+            for (const Route &route : routes[expert]) {
+                const auto &source = expert == 0 && !quantizeShared ? original : quantized;
+                memcpy(packed.data()+slot*dim,source.data()+size_t(route.token)*dim,dim*sizeof(uint16_t));
+                order[route.order] = slot++;
+            }
+        }
+        begins[expertCount+1] = slot;
+        DeepSeekV4MoeLinearTaskStorage gateStorage, downStorage;
+        const int tokenBatch = V41ReferenceMathEnabled() ? 4 : 8;
+        for (int expert = 0; expert <= expertCount; ++expert) {
+            for (int first = begins[expert]; first < begins[expert+1]; first += tokenBatch) {
+                int batch = std::min(tokenBatch,begins[expert+1]-first);
+                AppendDeepSeekV4MoeLinearTasks(gateStorage,packed.data()+size_t(first)*dim,*weights[expert*2],
+                    gate.data()+size_t(first)*mid*2,dim,mid*2,128,batch);
+                AppendDeepSeekV4MoeLinearTasks(downStorage,downInput.data()+size_t(first)*mid,*weights[expert*2+1],
+                    down.data()+size_t(first)*dim,mid,dim,256,batch);
+            }
+        }
+        gateStorage.BuildPointers(tasks);
+        ScheduleDeepSeekV4MoeTasks(tasks,false);
+        std::vector<MultiThreadDeepSeekV4MoeDownPrepareOp> prepare;
+        prepare.reserve(count*((mid+127)/128));
+        for (int expert = 0; expert <= expertCount; ++expert) {
+            for (int j = 0; j < int(routes[expert].size()); ++j) {
+                size_t current = begins[expert]+j;
+                for (int st = 0; st < mid; st += 128)
+                    prepare.emplace_back(gate.data()+current*mid*2,activation.data()+current*mid,
+                        downInput.data()+current*mid,mid,st,std::min(st+128,mid),true,
+                        routes[expert][j].scale,swigluLimit,true,true,true,32);
+            }
+        }
+        tasks.clear();tasks.reserve(prepare.size());
+        for (auto &task : prepare) tasks.push_back(&task);
+        ScheduleDeepSeekV4MoeTasks(tasks,false);
+        downStorage.BuildPointers(tasks);
+        ScheduleDeepSeekV4MoeTasks(tasks,false);
+        std::vector<MultiThreadV41MoePrefillReduceOp> reduceTasks;
+        for (int first = 0; first < n; first += rowsPerTask)
+            reduceTasks.emplace_back(down.data(),order.data(),(uint16_t *)output.cpuData,
+                                     dim,selected,first,std::min(first+rowsPerTask,n));
+        tasks.clear();
+        for (auto &task : reduceTasks) tasks.push_back(&task);
+        if (parallelRows) ScheduleDeepSeekV4MoeTasks(tasks,false);
+        else reduceTasks[0].Run();
+        return true;
     }
 
     static uint64_t GetConvertedBufferBytes(const Data &data) {
@@ -382,6 +553,7 @@ namespace fastllm {
         this->ops["Copy"] = (BaseOperator*)(new CpuCopyOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CpuDeepSeekV4HcPreOp());
         this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CpuDeepSeekV4HcPostOp());
+        this->ops["DeepSeekV41HcPost"] = (BaseOperator*)(new CpuDeepSeekV4HcPostOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CpuScaleQRatoryOp());
         this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CpuDeepSeekV4RotaryQuantOp());
         this->ops["DeepSeekV4SparseAttention"] = (BaseOperator*)(new CpuDeepSeekV4SparseAttentionOp());
@@ -392,6 +564,18 @@ namespace fastllm {
         this->ops["DeepSeekV4BuildCompressedKVFromRaw"] = (BaseOperator*)(new CpuDeepSeekV4BuildCompressedKVFromRawOp());
         this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CpuDeepSeekV4StoreWindowKVCacheOp());
         this->ops["DeepSeekV4UpdateWindowKVCache"] = (BaseOperator*)(new CpuDeepSeekV4UpdateWindowKVCacheOp());
+        this->ops["DeepSeekV41HcMix"] = (BaseOperator*)(new CpuDeepSeekV41HcMixOp());
+        this->ops["DeepSeekV41HcApplyPre"] = (BaseOperator*)(new CpuDeepSeekV41HcApplyPreOp());
+        this->ops["DeepSeekV41EngramApply"] = (BaseOperator*)(new CpuDeepSeekV41EngramApplyOp());
+        this->ops["DeepSeekV41RotaryQuant"] = (BaseOperator*)(new CpuDeepSeekV41RotaryQuantOp());
+        this->ops["DeepSeekV41Compress"] = (BaseOperator*)(new CpuDeepSeekV41CompressOp());
+        this->ops["DeepSeekV41IndexerScore"] = (BaseOperator*)(new CpuDeepSeekV41IndexerScoreOp());
+        this->ops["DeepSeekV41CandidateBlocks"] = (BaseOperator*)(new CpuDeepSeekV41CandidateBlocksOp());
+        this->ops["DeepSeekV41IndexerTopK"] = (BaseOperator*)(new CpuDeepSeekV41IndexerTopKOp());
+        this->ops["DeepSeekV41SparseAttention"] = (BaseOperator*)(new CpuDeepSeekV41SparseAttentionOp());
+        this->ops["DeepSeekV41WindowStore"] = (BaseOperator*)(new CpuDeepSeekV41WindowStoreOp());
+        this->ops["DeepSeekV41QuantizeActivation"] = (BaseOperator*)(new CpuDeepSeekV41QuantizeActivationOp());
+        this->ops["DeepSeekV41QuantizeKV"] = (BaseOperator*)(new CpuDeepSeekV41QuantizeKVOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CpuPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
@@ -668,6 +852,25 @@ namespace fastllm {
                 }
             }
         }
+    }
+
+    // The fused AVX2 kernel replaces the "dequantise the whole tile to BF16
+    // and run a BF16 GEMM" fallback used on CPUs without AVX512-BF16.  It is
+    // only profitable while the activation is narrow enough that the decoded
+    // weights cannot be amortised over many rows; wider GEMMs keep the old
+    // path.  FASTLLM_NVFP4_BLOCK32_AVX2_MAX_ROWS tunes the crossover and
+    // FASTLLM_DISABLE_NVFP4_BLOCK32_AVX2 restores the previous behaviour.
+    static int NVFP4Block32Avx2MaxRows() {
+        static const int value = []() {
+            if (!cpuInstructInfo.hasAVX2 ||
+                std::getenv("FASTLLM_DISABLE_NVFP4_BLOCK32_AVX2") != nullptr) {
+                return 0;
+            }
+            const char *env =
+                std::getenv("FASTLLM_NVFP4_BLOCK32_AVX2_MAX_ROWS");
+            return env != nullptr ? std::max(0, atoi(env)) : 32;
+        }();
+        return value;
     }
 
     template <int COLS, bool INPUT_BF16, bool SCALE_E8M0, bool PLANAR = false>
@@ -1756,6 +1959,13 @@ namespace fastllm {
             std::vector <uint16_t, alignedAllocator<uint16_t, 64> > dots3GatheredInput, dots3DownInput;
     } fastllmMoeDataManager;
 
+    // Registration code asks this before choosing between the compact
+    // block-32 layout and the block-16 one: the block-32 layout is only worth
+    // it when a fused kernel can consume it without a dequantisation buffer.
+    bool NVFP4Block32E8M0CpuKernelAvailable() {
+        return cpuInstructInfo.hasAVX512BF16 || NVFP4Block32Avx2MaxRows() > 0;
+    }
+
     void FastllmGemm (int n, int m, int k, 
         const void *A, long lda, // A [n * m], lda = bytes for 1 row in A
         const void *B, long ldb, // B [k * m], ldb = bytes for 1 row in B
@@ -1879,6 +2089,13 @@ namespace fastllm {
                     }
                     if (n <= 31 && cpuInstructInfo.hasAVX512BF16 &&
                         FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+                            bf16A_temp.data(), m * (long)sizeof(uint16_t),
+                            B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    if (n <= NVFP4Block32Avx2MaxRows() &&
+                        FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
                             bf16A_temp.data(), m * (long)sizeof(uint16_t),
                             B, ldb, C, ldc, n, m, k, st, end)) {
                         finish = true;
@@ -2067,6 +2284,21 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
+                    if (n <= NVFP4Block32Avx2MaxRows() &&
+                        FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
+                            A, lda, B, ldb, C, ldc,
+                            n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    static const bool tracedFallback = []() {
+                        if (std::getenv("FASTLLM_NVFP4_BLOCK32_TRACE") != nullptr) {
+                            printf("[Fastllm] NVFP4 block-32: falling back to "
+                                   "dequantise-then-BF16-GEMM.\n");
+                        }
+                        return true;
+                    }();
+                    (void)tracedFallback;
                     std::vector<uint16_t> bf16B_temp(
                         (size_t)(end - st) * m);
                     NVFP4Block32RowsToBFloat16(
@@ -2987,6 +3219,10 @@ namespace fastllm {
                             floatParams.find("swigluLimit")->second : 0.0f;
         bool deepSeekV4Mode = intParams.find("deepSeekV4Mode") != intParams.end() &&
                               intParams.find("deepSeekV4Mode")->second != 0;
+        int activationQuantBlock = intParams.count("activationQuantBlock") ? intParams.at("activationQuantBlock") : 128;
+        bool quantizeSharedExpert = intParams.count("quantizeSharedExpert") && intParams.at("quantizeSharedExpert") != 0;
+        AssertInFastLLM(activationQuantBlock == 32 || activationQuantBlock == 128,
+                        "CPU MergeMOE activation block must be 32 or 128.\n");
         bool useGeglu = intParams.find("gateType") != intParams.end() &&
                         intParams.find("gateType")->second == (int)MoeGateGeglu;
         output.Allocate();
@@ -3801,10 +4037,14 @@ namespace fastllm {
                  weights[2]->dataType == DataType::NVFP4 ||
                  weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                  weights[2]->dataType == DataType::BFLOAT16) &&
-                input.dims[0] < 32) {
+                (input.dims[0] < 32 || (deepSeekV4Mode && activationQuantBlock == 32))) {
             int outer = n;
             float *floatInput = input.dataType == DataType::FLOAT32 ? (float*)input.cpuData : nullptr;
             output.Allocate(0.0f);
+
+            if (deepSeekV4Mode && activationQuantBlock == 32 && !useGeglu &&
+                TryV41MoePrefill(input,output,weights,routedExpertCount,topk,indexData,scoreData,
+                    swigluLimit,quantizeSharedExpert)) return;
 
             const char *dots3PrefillEnv = std::getenv(
                 "FASTLLM_DOTS3_NOTE_PREFILL_FUSED");
@@ -4035,6 +4275,26 @@ namespace fastllm {
                     Float32ToBFloat16(inputData, bf16Input.data(), m);
                     bf16InputData = bf16Input.data();
                 }
+                uint16_t *originalBf16Input = bf16InputData;
+                std::vector<float> originalFloatRow(m), quantizedFloatRow;
+                BFloat16ToFloat32(originalBf16Input, originalFloatRow.data(), m);
+                std::vector<uint16_t> quantizedInput;
+                if (deepSeekV4Mode && activationQuantBlock == 32) {
+                    quantizedFloatRow = originalFloatRow;
+                    QuantizeDequantizeFP8E4M3Blocks(quantizedFloatRow.data(), m, 32);
+                    quantizedInput.resize(m);
+                    Float32ToBFloat16(quantizedFloatRow.data(), quantizedInput.data(), m);
+                    bf16InputData = quantizedInput.data();
+                    inputData = quantizedFloatRow.data();
+                } else if (inputData == nullptr) {
+                    inputData = originalFloatRow.data();
+                }
+                auto expertBf16Input = [&](int index) {
+                    return index == 0 && !quantizeSharedExpert ? originalBf16Input : bf16InputData;
+                };
+                auto expertFloatInput = [&](int index) {
+                    return index == 0 && !quantizeSharedExpert ? originalFloatRow.data() : inputData;
+                };
                 auto &middles = moeFloatSingleVarManager.middles;
                 auto &swigluResults = moeFloatSingleVarManager.swigluResults;
                 auto &results = moeFloatSingleVarManager.results;
@@ -4080,6 +4340,14 @@ namespace fastllm {
                 bool useDeepSeekV4MoeFast =
                     deepSeekV4Mode && !useGeglu && cpuInstructInfo.hasAVX512BF16 &&
                     std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST") == nullptr;
+                for (const auto &expert : v) {
+                    for (int part = 0; part < 2; part++) {
+                        DataType type = weights[expert.first * 2 + part]->dataType;
+                        useDeepSeekV4MoeFast = useDeepSeekV4MoeFast &&
+                            (type == DataType::FP8_E4M3 || type == DataType::NVFP4 ||
+                             type == DataType::BFLOAT16 || type == DataType::FLOAT16);
+                    }
+                }
                 if (useDeepSeekV4MoeFast) {
                     constexpr int gateRowsPerTask = 128;
                     constexpr int downRowsPerTask = 256;
@@ -4092,7 +4360,7 @@ namespace fastllm {
                         int idx = v[l].first;
                         Data &weight = *weights[idx * 2];
                         AppendDeepSeekV4MoeLinearTasks(
-                            gateTaskStorage, bf16InputData, weight,
+                            gateTaskStorage, expertBf16Input(idx), weight,
                             middles[l].data(),
                             m, weight.dims[0], gateRowsPerTask);
                     }
@@ -4121,7 +4389,8 @@ namespace fastllm {
                         int mid = spatial / 2;
                         Data &weightDown = *weights[idx * 2 + 1];
                         bool quantize = weightDown.dataType == DataType::FP8_E4M3 ||
-                                        weightDown.dataType == DataType::NVFP4;
+                                        weightDown.dataType == DataType::NVFP4 ||
+                                        (idx == 0 && quantizeSharedExpert);
                         bool routed = idx != 0;
                         float routeWeight = routed ? v[l].second : 1.0f;
                         uint16_t *downInputData =
@@ -4131,8 +4400,8 @@ namespace fastllm {
                             downPrepareTaskStorage.emplace_back(
                                 middles[l].data(), swigluResults[l].data(),
                                 downInputData, mid, st, end,
-                                routed, routeWeight, swigluLimit,
-                                true, quantize, true);
+                                routed || activationQuantBlock == 32, routeWeight, swigluLimit,
+                                true, quantize, true, activationQuantBlock);
                         }
                     }
                     std::vector<MultiThreadBaseOp*> downPrepareTasks;
@@ -4191,19 +4460,22 @@ namespace fastllm {
                         int curThread = (curK / k) * base;
                         if (weight->dataType == DataType::FP8_E4M3) {
                             LaunchLinearBFloat16FP8E4M3(
-                                bf16InputData, *weight, outputData, biasData,
+                                expertBf16Input(idx), *weight, outputData, biasData,
                                 1, m, curK, ops, pool, threadSt, curThread);
                         } else if (weight->dataType == DataType::NVFP4 ||
                                    weight->dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                             if (cpuInstructInfo.hasAVX512BF16) {
-                                LaunchLinearBFloat16NVFP4(bf16InputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                                LaunchLinearBFloat16NVFP4(expertBf16Input(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                             } else {
-                                LaunchLinearFloat32NVFP4(inputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                                LaunchLinearFloat32NVFP4(expertFloatInput(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                             }
                         } else if (weight->dataType == DataType::BFLOAT16) {
-                            LaunchLinearBFloat16BFloat16(bf16InputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                            LaunchLinearBFloat16BFloat16(expertBf16Input(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                        } else if (weight->dataType == DataType::FLOAT16) {
+                            LaunchLinearFloat32Float16(expertFloatInput(idx), *weight, outputData, biasData,
+                                                       1, m, curK, ops, pool, threadSt, curThread);
                         } else {
-                            // TODO: other
+                            ErrorInFastLLM("Unsupported gate dtype in DeepSeek CPU MoE.\n");
                         }
                         threadSt += curThread;
                     }
@@ -4237,17 +4509,19 @@ namespace fastllm {
                             for (int i = 0; i < mid; i++) {
                                 float gate = RoundFloat32ToBFloat16RNE(outputData[i]);
                                 float up = RoundFloat32ToBFloat16RNE(outputData[mid + i]);
-                                if (routed && swigluLimit > 0.0f) {
+                                if ((routed || activationQuantBlock == 32) && swigluLimit > 0.0f) {
                                     gate = std::min(gate, swigluLimit);
                                     up = std::max(-swigluLimit, std::min(up, swigluLimit));
                                 }
-                                float h = (gate / (1.0f + std::exp(-gate))) * up;
+                                float exponent = activationQuantBlock == 32 && V41ReferenceMathEnabled() ? V41CPUMath().Exp(-gate) : std::exp(-gate);
+                                float h = (gate / (1.0f + exponent)) * up;
                                 swigluData[i] = RoundFloat32ToBFloat16RNE(routeWeight * h);
                             }
                             if (weightDown->dataType == DataType::FP8_E4M3 ||
                                 weightDown->dataType == DataType::NVFP4 ||
-                                weightDown->dataType == DataType::NVFP4_BLOCK_16_E4M3) {
-                                QuantizeDequantizeFP8E4M3Block128(swigluData, mid);
+                                weightDown->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                                (idx == 0 && quantizeSharedExpert)) {
+                                QuantizeDequantizeFP8E4M3Blocks(swigluData, mid, activationQuantBlock);
                             }
                             if (weightDown->dataType == DataType::FP8_E4M3 ||
                                 (weightDown->dataType == DataType::NVFP4 && cpuInstructInfo.hasAVX512BF16) ||
@@ -4317,8 +4591,11 @@ namespace fastllm {
                             }
                         } else if (weightDown->dataType == DataType::BFLOAT16) {
                             LaunchLinearBFloat16BFloat16((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                        } else if (weightDown->dataType == DataType::FLOAT16) {
+                            LaunchLinearFloat32Float16(swigluResults[l].data(), *weightDown, results[l].data(), nullptr,
+                                                       1, mid, m, ops, pool, threadSt, curThread);
                         } else {
-                            // TODO: other
+                            ErrorInFastLLM("Unsupported down dtype in DeepSeek CPU MoE.\n");
                         }
                         threadSt += curThread;               
                     }

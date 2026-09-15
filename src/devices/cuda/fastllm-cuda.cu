@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
 #endif
@@ -630,13 +631,22 @@ void DeviceSync() {
     }
 }
 
+// 定义在 FastllmCudaGraphSetError 之后（它是本文件的 static）
+static bool FastllmCudaSwallowCaptureError(const char *stage, cudaError_t state);
+
 void ForceDeviceSync() {
     cudaError_t state = cudaDeviceSynchronize();
+    if (FastllmCudaSwallowCaptureError("cudaDeviceSynchronize", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when synchronizing device!", state);
 }
 
 void FastllmCudaSyncCurrentThreadStream() {
     cudaError_t state = cudaStreamSynchronize(cudaStreamPerThread);
+    if (FastllmCudaSwallowCaptureError("cudaStreamSynchronize", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when synchronizing the per-thread stream!", state);
 }
 
@@ -731,6 +741,24 @@ static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
     }
     fastllmCudaGraphLastError = std::string(stage) + ": " + cudaGetErrorString(err);
     return false;
+}
+// 捕获期间调用同步 CUDA API（cudaMemcpy / cudaMemset / cudaDeviceSynchronize 等）
+// 会返回 cudaErrorStreamCaptureUnsupported。这时**不能**走 checkCudaErrors：它会
+// ErrorInFastLLM -> exit()，把整个进程带走。捕获本来就是可以放弃的，记下线程错误
+// 让捕获方自己结束捕获、丢掉图、退回逐算子即可。返回 true 表示已经吞掉。
+static bool FastllmCudaSwallowCaptureError(const char *stage, cudaError_t state) {
+    if (state != cudaErrorStreamCaptureUnsupported &&
+        state != cudaErrorStreamCaptureInvalidated &&
+        state != cudaErrorStreamCaptureImplicit &&
+        state != cudaErrorStreamCaptureIsolation &&
+        state != cudaErrorStreamCaptureMerge &&
+        state != cudaErrorStreamCaptureWrongThread) {
+        return false;
+    }
+    cudaGetLastError();
+    FastllmCudaGraphSetError(stage, state);
+    FastllmCudaSetThreadError();
+    return true;
 }
 
 bool FastllmCudaGraphBeginCapture() {
@@ -1334,6 +1362,13 @@ bool FastllmCudaGraphEndCapture(void **graph) {
     if (graph != nullptr) {
         *graph = (void*)cudaGraph;
     }
+    if (state != cudaSuccess) {
+        // 捕获被判废之后，运行时的 last-error 会一直粘着（后续任何 kernel 的
+        // cudaGetLastError 都会拿到 "operation failed due to a previous error
+        // during capture"），必须在这里清掉，否则回退到逐算子的第一个算子就会
+        // 误判为 kernel 失败。
+        cudaGetLastError();
+    }
     return FastllmCudaGraphSetError("cudaStreamEndCapture", state);
 }
 
@@ -1433,6 +1468,12 @@ bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
 bool FastllmCudaGraphLaunch(void *exec) {
     cudaError_t state = cudaGraphLaunch((cudaGraphExec_t)exec, cudaStreamPerThread);
     return FastllmCudaGraphSetError("cudaGraphLaunch", state);
+}
+
+// 清掉当前线程/上下文粘着的 CUDA 运行时错误。捕获失败后回退到逐算子之前必须调用，
+// 否则第一个算子的 cudaGetLastError 会拿到捕获阶段留下的错误。
+void FastllmCudaClearLastError() {
+    cudaGetLastError();
 }
 
 void FastllmCudaGraphDestroy(void *graph) {
@@ -4817,6 +4858,9 @@ void FastllmCudaMemset0(void *ret, size_t size) {
     } else {
         state = cudaMemset(ret, 0, size);
     }
+    if (FastllmCudaSwallowCaptureError("cudaMemset", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when clearing device memory!", state);
 }
 
@@ -5799,6 +5843,9 @@ void FastllmCudaClearBigBufferAll() {
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
+    if (FastllmCudaSwallowCaptureError("cudaMemcpy(HostToDevice)", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
     //cudaDeviceSynchronize();
 }
@@ -5820,6 +5867,9 @@ void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t siz
 
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
+    if (FastllmCudaSwallowCaptureError("cudaMemcpy(DeviceToHost)", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
     //cudaDeviceSynchronize();
 }
@@ -15765,6 +15815,171 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
     return FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
         logits, temperatures, topKArr, topPArr, output, batch, vocabSize,
         nullptr, nullptr, nullptr, nullptr, 0, 0.09f, 0.3f);
+}
+
+namespace {
+// Both proposal generation and target verification use the same distribution
+// as TopKTopPSamplingFromProb: intersect top-k and top-p on the original
+// temperature softmax. Applying top-k first and then top-p would change p.
+struct FastllmMtpSamplingWorkspace {
+    uint8_t *scratch = nullptr;
+    bool own = false;
+    float *a, *b, *temperatures, *topPs;
+    int *topKs, *output, *draftIds, *accepted, *emitted;
+    bool *valid;
+    flashinfer::sampling::RadixRowState *rowStates;
+    explicit FastllmMtpSamplingWorkspace(int rows, int vocab) {
+        size_t need = 0;
+        auto reserve = [&](size_t bytes) {
+            size_t offset = need;
+            need += FastllmCudaAlignBytes(bytes, 256);
+            return offset;
+        };
+        size_t ao = reserve((size_t)rows * vocab * sizeof(float));
+        size_t bo = reserve((size_t)rows * vocab * sizeof(float));
+        size_t to = reserve(rows * sizeof(float)), ko = reserve(rows * sizeof(int));
+        size_t po = reserve(rows * sizeof(float)), oo = reserve(rows * sizeof(int));
+        size_t doff = reserve(rows * sizeof(int)), ac = reserve(rows * sizeof(int));
+        size_t em = reserve(rows * sizeof(int)), va = reserve(rows * sizeof(bool));
+        size_t rs = reserve(rows * sizeof(flashinfer::sampling::RadixRowState));
+        size_t bytes = 0;
+        scratch = (uint8_t*)FastllmBorrowDequantScratch(need, &bytes, &own);
+        if (!scratch || bytes < need) {
+            FastllmReleaseDequantScratch(scratch, own);
+            scratch = nullptr;
+            return;
+        }
+        a = (float*)(scratch + ao); b = (float*)(scratch + bo);
+        temperatures = (float*)(scratch + to); topKs = (int*)(scratch + ko);
+        topPs = (float*)(scratch + po); output = (int*)(scratch + oo);
+        draftIds = (int*)(scratch + doff); accepted = (int*)(scratch + ac);
+        emitted = (int*)(scratch + em); valid = (bool*)(scratch + va);
+        rowStates = (flashinfer::sampling::RadixRowState*)(scratch + rs);
+    }
+    ~FastllmMtpSamplingWorkspace() { FastllmReleaseDequantScratch(scratch, own); }
+    bool Prepare(float *logits, const float *hostTemperatures,
+                 const int *hostTopKs, const float *hostTopPs, int rows, int vocab) {
+        if (!scratch) return false;
+        std::vector<float> ts(rows), ps(rows);
+        std::vector<int> ks(rows);
+        bool needTopP = false, needTopK = false;
+        for (int i = 0; i < rows; ++i) {
+            if (!std::isfinite(hostTemperatures[i]) || hostTemperatures[i] <= 0 ||
+                !std::isfinite(hostTopPs[i]) || hostTopPs[i] <= 0 || hostTopPs[i] > 1)
+                return false;
+            ts[i] = hostTemperatures[i];
+            ps[i] = hostTopPs[i];
+            ks[i] = hostTopKs[i] <= 0 ? vocab : std::min(hostTopKs[i], vocab);
+            needTopP |= ps[i] < 1;
+            needTopK |= ks[i] < vocab;
+        }
+        FastllmCudaCopyFromHostToDevice(temperatures, ts.data(), rows * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(topKs, ks.data(), rows * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(topPs, ps.data(), rows * sizeof(float));
+        cudaStream_t stream = cudaStreamPerThread;
+        FastllmTemperatureSoftmaxKernel<1024><<<rows, 1024, 0, stream>>>(
+            logits, a, temperatures, vocab);
+        cudaError_t state = cudaGetLastError();
+        if (state == cudaSuccess && needTopP) {
+            state = flashinfer::sampling::TopPRenormProb<float>(
+                a, b, topPs, rows, 1.0f, vocab, stream);
+            std::swap(a, b);
+        }
+        if (state == cudaSuccess && needTopK) {
+            state = cudaMemsetAsync(rowStates, 0,
+                rows * sizeof(flashinfer::sampling::RadixRowState), stream);
+            if (state == cudaSuccess) {
+                state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+                    a, b, topKs, rows, 0, vocab, rowStates, stream);
+                std::swap(a, b);
+            }
+        }
+        return state == cudaSuccess;
+    }
+};
+uint64_t FastllmMtpSamplingSeed() {
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    return rng();
+}
+}
+
+bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
+                              const float *temperatures, const int *topKs,
+                              const float *topPs, int *output, int batch, int vocabSize) {
+    if (!logits || !proposalProbs || !temperatures || !topKs || !topPs ||
+        !output || batch <= 0 || vocabSize <= 0) return false;
+    FastllmMtpSamplingWorkspace ws(batch, vocabSize);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, batch, vocabSize)) return false;
+    cudaStream_t stream = cudaStreamPerThread;
+    // Persist exactly the probabilities used for sampling, before scratch reuse.
+    cudaError_t state = cudaMemcpyAsync(proposalProbs, ws.a,
+        (size_t)batch * vocabSize * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    if (state == cudaSuccess) {
+        state = flashinfer::sampling::SamplingFromProb<float, int>(
+            proposalProbs, ws.output, ws.valid, nullptr, batch, vocabSize, true,
+            nullptr, FastllmMtpSamplingSeed(), nullptr, 0, stream);
+    }
+    if (state != cudaSuccess) return false;
+    FastllmCudaCopyFromDeviceToHost(output, ws.output, batch * sizeof(int));
+    DeviceSync();
+    return std::all_of(output, output + batch,
+                       [vocabSize](int id) { return id >= 0 && id < vocabSize; });
+}
+
+bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+                                    const float *temperatures, const int *topKs,
+                                    const float *topPs, const int *draftTokenIds,
+                                    int *output, int *acceptedDraftTokens,
+                                    int batch, int draftTokens, int vocabSize) {
+    if (!logits || !proposalProbs || !temperatures || !topKs || !topPs ||
+        !draftTokenIds || !output || !acceptedDraftTokens || batch <= 0 ||
+        draftTokens <= 0 || vocabSize <= 0) return false;
+    const int rows = batch * (draftTokens + 1);
+    for (int i = 0; i < batch * draftTokens; ++i)
+        if (draftTokenIds[i] < 0 || draftTokenIds[i] >= vocabSize) return false;
+    FastllmMtpSamplingWorkspace ws(rows, vocabSize);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocabSize)) return false;
+    FastllmCudaCopyFromHostToDevice(ws.draftIds, (void*)draftTokenIds,
+                                   batch * draftTokens * sizeof(int));
+    cudaStream_t stream = cudaStreamPerThread;
+    cudaError_t state = cudaMemsetAsync(ws.accepted, 0, batch * sizeof(int), stream);
+    if (state == cudaSuccess)
+        state = cudaMemsetAsync(ws.emitted, 0, batch * sizeof(int), stream);
+    if (state == cudaSuccess) {
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+            proposalProbs, ws.draftIds, ws.a, ws.output, ws.accepted, ws.emitted,
+            batch, draftTokens, vocabSize, true, nullptr, FastllmMtpSamplingSeed(),
+            nullptr, 0, stream);
+    }
+    if (state != cudaSuccess) return false;
+    FastllmCudaCopyFromDeviceToHost(output, ws.output, rows * sizeof(int));
+    // emitted counts the accepted prefix; accepted also counts later positions
+    // after the first rejection and must never be used as the commit length.
+    FastllmCudaCopyFromDeviceToHost(acceptedDraftTokens, ws.emitted, batch * sizeof(int));
+    DeviceSync();
+    for (int b = 0; b < batch; ++b) {
+        int n = acceptedDraftTokens[b];
+        if (n < 0 || n > draftTokens) return false;
+        for (int i = 0; i <= n; ++i)
+            if (output[b * (draftTokens + 1) + i] < 0 ||
+                output[b * (draftTokens + 1) + i] >= vocabSize) return false;
+    }
+    return true;
+}
+
+bool FastllmCudaMtpRejectionSamplingLogits(float *logits,
+        const float *proposalLogits, const float *proposalLogsumexp,
+        const int *deviceDraftTokens, const float *temperatures,
+        const int *topKs, const float *topPs, int *output, int *accepted,
+        int batch, int drafts, int vocab) {
+    if (!logits || !proposalLogits || !proposalLogsumexp || !deviceDraftTokens ||
+        !temperatures || !topKs || !topPs || !output || !accepted ||
+        batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
+    const int rows = batch * (drafts + 1);
+    FastllmMtpSamplingWorkspace ws(rows, vocab);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocab)) return false;
+    return FastllmCudaMtpRejectionFromProbs(ws.a, proposalLogits, proposalLogsumexp,
+        deviceDraftTokens, output, accepted, batch, drafts, vocab);
 }
 
 struct FastllmGreedyPartial {

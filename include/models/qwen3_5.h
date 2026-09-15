@@ -234,10 +234,30 @@ namespace fastllm {
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
         int mtp_num_hidden_layers = 0;
+        struct MtpDraftPrefixGraph;
         struct MtpKvCache {
             Data key;
             Data value;
             int tokens = 0;
+            // The actual proposal distribution belongs to this chain.
+            // Truncate only changes KV, never the saved proposal or tokens.
+            bool sampleProposal = false;
+            bool proposalUsesLogits = false;
+            bool deferProposalTokens = false;
+            GenerationConfig proposalConfig;
+            Data proposalProbs;
+            Data proposalLogsumexp;
+            Data proposalDeviceTokens;
+            Data proposalFloatTokens;
+            std::map<int, std::shared_ptr<MtpDraftPrefixGraph> > prefixGraphs;
+            std::vector<int> proposalTokens;
+            void BeginProposal(const GenerationConfig &config) {
+                sampleProposal = !config.IsSimpleGreedy();
+                proposalConfig = config;
+                proposalTokens.clear();
+                proposalUsesLogits = false;
+                deferProposalTokens = false;
+            }
             // TP parents keep only global shape/length; each rank owns its pages.
             std::map<int, std::unique_ptr<MtpKvCache> > shards;
 
@@ -280,13 +300,16 @@ namespace fastllm {
         bool speculativeCacheOnlyForward = false;
         Data speculativeHiddenStates;
         std::vector <Data> speculativeDFlashHiddenStates;
-        std::vector<unsigned char> speculativeTypicalAccepted;
+        std::vector<unsigned char> speculativeMtpAccepted;
+        std::vector<MtpKvCache*> speculativeMtpSamplingContexts;
         DFlashContext *speculativeDFlashSamplingContext = nullptr;
         std::vector<DFlashContext*> speculativeDFlashSamplingContexts;
         std::vector<unsigned char> speculativeDFlashAccepted;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
+        // Verify graphs capture addresses in this scratch storage.
+        unsigned long long speculativeLinearStateGeneration = 0;
         std::vector<std::vector<int> > speculativeLinearCaptureMask;
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
         std::vector<int> speculativeFirstTokenLinearCaptureMask;
@@ -339,6 +362,7 @@ namespace fastllm {
         std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
+        std::string visionDevice = "auto";
         int vision_depth = 0;
         int vision_hidden_size = 0;
         int vision_num_heads = 0;
@@ -511,17 +535,19 @@ namespace fastllm {
                 const std::vector<Data*> &positionIds,
                 const std::vector<int> &sampleRows,
                 std::vector<Data> *sampledHiddenStates, bool cacheOnly);
+        std::vector<int> SampleMtpDraftLogits(int device, Data &logits,
+                                             const std::vector<MtpKvCache*> &caches);
         void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
-        int RunMtpGreedyDraft(int device, const std::vector<int> &devices,
+        int RunMtpDraft(int device, const std::vector<int> &devices,
                               MtpKvCache &cache,
                               const Data &targetHiddenStates,
                               const std::vector<int> &inputTokens,
                               const Data &positionIds, int sampleRow,
                               Data *sampledHiddenStates = nullptr,
                               bool cacheOnly = false);
-        std::vector<int> RunMtpGreedyDraftBatch(
+        std::vector<int> RunMtpDraftBatch(
                               int device,
                               const std::vector<int> &devices,
                               const std::vector<MtpKvCache*> &caches,

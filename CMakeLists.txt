@@ -208,7 +208,7 @@ file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp src/prompt_lookup.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
-        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/dots3_note.cpp
+        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
@@ -356,7 +356,8 @@ if (USE_CUDA)
     endif()
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
-        src/devices/cuda/fastllm-cuda.cu 
+        src/devices/cuda/fastllm-cuda.cu
+        src/devices/cuda/fastllm-cuda-mtp.cu
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
@@ -381,7 +382,12 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/dots3-note-kernels.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
+        src/devices/cuda/models/deepseekv41-kernels.cu
+        src/devices/cuda/models/deepseekv41-reference.cu
+        src/devices/cuda/models/deepseekv41-dspark-kernels.cu
         src/devices/cuda/models/qwen4-kernels.cu)
+
+    set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
     if (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
@@ -639,6 +645,10 @@ target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
     enable_testing()
+    add_executable(device_operator_lifetime_test test/basic/test_device_operator_lifetime.cpp)
+    target_link_libraries(device_operator_lifetime_test PRIVATE fastllm)
+    add_test(NAME device_operator_lifetime COMMAND device_operator_lifetime_test)
+
     find_package(Threads REQUIRED)
     add_executable(ncclSubmitRendezvousRegression test/ops/ncclSubmitRendezvousRegression.cpp)
     target_include_directories(ncclSubmitRendezvousRegression PRIVATE include)
@@ -673,6 +683,27 @@ if (UNIT_TEST)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
+    add_executable(deepseekV41PrecisionRegression test/ops/deepseekV41PrecisionRegression.cpp)
+    target_link_libraries(deepseekV41PrecisionRegression fastllm)
+    add_test(NAME deepseekV41PrecisionCpu COMMAND deepseekV41PrecisionRegression)
+    add_test(NAME deepseekV41PrecisionCpuFallback COMMAND deepseekV41PrecisionRegression)
+    set_tests_properties(deepseekV41PrecisionCpuFallback PROPERTIES
+        ENVIRONMENT "FASTLLM_DSV4_DISABLE_CPU_MOE_FAST=1")
+    if (USE_CUDA)
+        target_include_directories(deepseekV41PrecisionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME deepseekV41PrecisionCuda COMMAND deepseekV41PrecisionRegression --cuda)
+        set_tests_properties(deepseekV41PrecisionCuda PROPERTIES LABELS cuda TIMEOUT 300)
+    endif()
+    add_executable(nvfp4Block32GemmRegression test/ops/nvfp4Block32GemmRegression.cpp)
+    target_link_libraries(nvfp4Block32GemmRegression fastllm)
+    add_test(NAME nvfp4_block32_gemm COMMAND nvfp4Block32GemmRegression)
+    add_executable(deepseekV41OpsRegression test/ops/deepseekV41OpsRegression.cpp)
+    target_link_libraries(deepseekV41OpsRegression fastllm)
+    if (USE_CUDA)
+        target_include_directories(deepseekV41OpsRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
+    add_test(NAME deepseek_v41_ops COMMAND deepseekV41OpsRegression)
+    set_tests_properties(deepseek_v41_ops PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     add_executable(contextExtensionRegression test/ops/contextExtension.cpp)
     target_link_libraries(contextExtensionRegression fastllm)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)
@@ -687,7 +718,20 @@ if (UNIT_TEST)
         target_link_libraries(qwen35_mtp_tp_wide_test PRIVATE fastllm)
         add_test(NAME qwen35_mtp_tp_wide COMMAND qwen35_mtp_tp_wide_test --smoke)
         set_tests_properties(qwen35_mtp_tp qwen35_mtp_tp_wide
-                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                             PASS_REGULAR_EXPRESSION "TOTAL [0-9]+ PASS")
+        add_executable(cuda_mtp_gumbel_test test/basic/test_cuda_mtp_gumbel.cpp)
+        target_link_libraries(cuda_mtp_gumbel_test PRIVATE fastllm)
+        target_include_directories(cuda_mtp_gumbel_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_mtp_gumbel COMMAND cuda_mtp_gumbel_test)
+        set_tests_properties(cuda_mtp_gumbel PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                             PASS_REGULAR_EXPRESSION "MTP Gumbel/rejection: PASS")
+        add_executable(cuda_mtp_rejection_test test/basic/test_cuda_mtp_rejection.cpp)
+        target_link_libraries(cuda_mtp_rejection_test PRIVATE fastllm)
+        target_include_directories(cuda_mtp_rejection_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_mtp_rejection COMMAND cuda_mtp_rejection_test)
+        set_tests_properties(cuda_mtp_rejection PROPERTIES LABELS "cuda" SKIP_RETURN_CODE 77)
+
         add_executable(qwen35_mtp_sample_row_test test/basic/test_qwen35_mtp_sample_row.cpp)
         target_link_libraries(qwen35_mtp_sample_row_test PRIVATE fastllm)
         add_test(NAME qwen35_mtp_sample_row COMMAND qwen35_mtp_sample_row_test)
@@ -698,6 +742,13 @@ if (UNIT_TEST)
         set_tests_properties(qwen35_mtp_sample_row qwen35_mtp_sample_row_moe
                              qwen35_mtp_sample_row_causal qwen35_mtp_cache_rollback qwen35_mtp_paged_pool
                              PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(qwen35_mtp_sampling_test test/basic/test_qwen35_mtp_sampling.cpp)
+        target_link_libraries(qwen35_mtp_sampling_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_sampling COMMAND qwen35_mtp_sampling_test)
+        add_test(NAME qwen35_mtp_sampling_batch COMMAND qwen35_mtp_sampling_test --batch)
+        set_tests_properties(qwen35_mtp_sampling qwen35_mtp_sampling_batch PROPERTIES
+                             LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(qwen35_streaming_weights_test test/basic/test_qwen35_streaming_weights.cpp)
         target_link_libraries(qwen35_streaming_weights_test PRIVATE fastllm)
@@ -742,6 +793,13 @@ if (UNIT_TEST)
                 set_tests_properties(cuda_fp8_perchannel_dispatch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
             endif()
         endif()
+
+        add_executable(cuda_fp8_cache_tp_test test/basic/test_cuda_fp8_cache_tp.cpp)
+        target_link_libraries(cuda_fp8_cache_tp_test PRIVATE fastllm Threads::Threads)
+        target_include_directories(cuda_fp8_cache_tp_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_fp8_cache_tp COMMAND cuda_fp8_cache_tp_test)
+        set_tests_properties(cuda_fp8_cache_tp PROPERTIES
+                             LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 30)
 
         add_executable(cuda_single_query_attention_test test/basic/test_cuda_single_query_attention.cpp)
         target_link_libraries(cuda_single_query_attention_test PRIVATE fastllm)
@@ -839,9 +897,28 @@ if (UNIT_TEST)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+        add_executable(marlinGraphScratchRegression test/ops/marlinGraphScratchRegression.cpp)
+        target_link_libraries(marlinGraphScratchRegression fastllm)
+        target_include_directories(marlinGraphScratchRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        foreach(marlin_dtype IN ITEMS nvfp4 fp8)
+            add_test(NAME marlin_graph_scratch_${marlin_dtype}
+                     COMMAND marlinGraphScratchRegression ${marlin_dtype})
+            set_tests_properties(marlin_graph_scratch_${marlin_dtype} PROPERTIES
+                LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
+
         add_executable(customAllReduceRegression test/ops/customAllReduceRegression.cpp)
         target_link_libraries(customAllReduceRegression fastllm)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+        if (UNIX)
+            add_executable(customArRegistrationRegression test/ops/customArRegistrationRegression.cu)
+            target_link_libraries(customArRegistrationRegression PRIVATE fastllm_tools)
+            add_test(NAME custom_ar_registration COMMAND customArRegistrationRegression)
+            add_test(NAME custom_ar_registration_pool_reuse COMMAND customArRegistrationRegression reuse)
+            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse PROPERTIES
+                LABELS cuda TIMEOUT 30 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endif()
 
         add_executable(fp8TpRepackDeadlockRegression test/ops/fp8TpRepackDeadlockRegression.cpp)
         target_link_libraries(fp8TpRepackDeadlockRegression fastllm)
@@ -883,6 +960,8 @@ if (UNIT_TEST)
         target_include_directories(qwen4HyperMixRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME qwen4HyperMix COMMAND qwen4HyperMixRegression)
         set_tests_properties(qwen4HyperMix PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+
+        set_tests_properties(deepseek_v41_ops PROPERTIES LABELS cuda)
 
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         target_link_libraries(ncclOddTpRegression fastllm)
@@ -956,6 +1035,11 @@ if (${CMAKE_HOST_WIN32})
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
 else()
+    # Keep the linker output at its packaged location so dependent targets
+    # track a stable artifact. The generator expression also keeps that path
+    # unchanged for multi-config generators.
+    set_target_properties(fastllm_tools PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/tools/ftllm>")
     add_custom_command(
             TARGET fastllm_tools
             POST_BUILD
@@ -964,8 +1048,6 @@ else()
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_triton_server.py ${CMAKE_BINARY_DIR}/tools/ftllm/fastllm_triton_server.py
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/libfastllm_tools.* ${CMAKE_BINARY_DIR}/tools/ftllm/.
-            COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/libfastllm_tools.*
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
 endif()

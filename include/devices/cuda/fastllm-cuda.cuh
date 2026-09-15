@@ -155,6 +155,8 @@ bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
         void **exec);
 bool FastllmCudaGraphLaunch(void *exec);
 void FastllmCudaGraphDestroy(void *graph);
+// 清掉当前线程粘着的 CUDA 运行时错误（捕获失败后回退到逐算子之前必须调用）
+void FastllmCudaClearLastError();
 void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
 bool FastllmCudaGraphIsCapturing();
@@ -434,6 +436,17 @@ bool FastllmCudaPreparePagedBatchParamsSingle(
     int32_t *qSizes, int32_t *pageSizes, int32_t *pageIndexs,
     int32_t *lastPageLens, const int *pageIdxHost, int pageIndexCount,
     int totalPages, int qSize, int lastPageLen);
+// Upload the paged batch parameters via a kernel carrying the values in its
+// parameter space (upstream #722): bounded chunks fit legacy 4 KiB limits,
+// avoid blocking pageable H2D copies, and can be captured by a CUDA Graph.
+// Returns false for unsupported sizes; callers keep the memcpy fallback.
+bool FastllmCudaUploadPagedIntParams(
+    int32_t *qSizes, int qSizesCount,
+    int32_t *pageSizes, int pageSizesCount,
+    int32_t *pageIndexs, int pageIndexsCount,
+    int32_t *lastPageLens, int lastPageLensCount,
+    const int *qSizesHost, const int *pageSizesHost,
+    const int *pageIndexsHost, const int *lastPageLensHost);
 void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, int32_t *pageOffsetArray,
                                     int pageLen, int batch, int numHeads, int headDim,
                                     fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
@@ -467,6 +480,7 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
                              const fastllm::Data &gate);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
+bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale = 1.0f);
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
@@ -822,6 +836,47 @@ bool FastllmCudaDeepSeekV4HashRouteScoreGraph(const fastllm::Data &logits, fastl
 // Drop every per-device CUDA copy owned by a CPU route table. Data destruction
 // calls this before the object's address can be reused by another model.
 void FastllmCudaReleaseDeepSeekV4RouteTableCache(const fastllm::Data *routeTable);
+// ---- DeepSeek-V4.1 专用 kernel（src/devices/cuda/models/deepseekv41-kernels.cu）----
+bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fastllm::Data &hcScale,
+                                 fastllm::Data &hcBase, int hcMult, int sinkhornIters, float eps,
+                                 float normEps, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb);
+bool FastllmCudaDeepSeekV41HcApplyPre(const fastllm::Data &x, const fastllm::Data &pre, fastllm::Data &y);
+// HcApplyPre + RMSNorm 的融合（结果与两步分开做逐 bit 相同；不支持的形状返回 false）
+bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
+                                     fastllm::Data &normWeight, float eps, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Data &kv,
+                                       fastllm::Data &qWeight, fastllm::Data &kWeight,
+                                       const fastllm::Data *mask, float eps, float clampValue);
+bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
+                                       int posStep, bool inverse, int originalSeqLen, float ropeFactor,
+                                       int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock);
+bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fastllm::Data *score,
+                                    fastllm::Data &normWeight, int ratio, float normEps, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,
+                                        const fastllm::Data &k, int ratio, int startPos,
+                                        fastllm::Data &output);
+bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score, int blockSize, int topkBlocks,
+                                           int ratio, int startPos, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, const fastllm::Data *candidates,
+                                       int topK, int ratio, int startPos, int blockSize, fastllm::Data &output);
+// DSpark 草稿侧的 markov head 整条链（src/devices/cuda/models/deepseekv41-dspark-kernels.cu）
+bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits, const fastllm::Data &embedWeight,
+                                       const fastllm::Data &headWeight, int anchorToken, int block,
+                                       std::vector<int> &outTokens, fastllm::Data &outEmbeds);
+bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
+                                           const fastllm::Data *ringKV, const fastllm::Data *compressedKV,
+                                           const fastllm::Data *cmpIdx, fastllm::Data &attnSink,
+                                           int windowSize, int startPos, float softmaxScale,
+                                           fastllm::Data &output);
+bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos, int windowSize);
+bool FastllmCudaDeepSeekV41QuantizeActivation(const fastllm::Data &input, fastllm::Data &output);
+// Input has already undergone block-32 FP8 activation quantization.
+bool FastllmCudaDeepSeekV41LinearBlock32(const fastllm::Data &input, fastllm::Data &weight,
+                                      fastllm::Data &output);
+
+bool FastllmCudaDeepSeekV41QuantizeKV(const fastllm::Data &input, fastllm::Data &output,
+                                      int quantMode = 1, int quantBlock = 32);
+
 bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
                                 fastllm::Data &hcScale, fastllm::Data &hcBase,
                                 int hcMult, int sinkhornIters, float eps, float normEps,
@@ -1402,6 +1457,17 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize);
+// proposalProbs is a persistent CUDA buffer; other arrays except logits are host arrays.
+// Draft sampling and verification intersect top-k/top-p on the original softmax.
+bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
+                              const float *temperatures, const int *topKs,
+                              const float *topPs, int *output, int batch, int vocabSize);
+bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+                                    const float *temperatures, const int *topKs,
+                                    const float *topPs, const int *draftTokenIds,
+                                    int *output, int *acceptedDraftTokens,
+                                    int batch, int draftTokens, int vocabSize);
+
 bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
