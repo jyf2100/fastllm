@@ -1,5 +1,7 @@
 # Tasks: add-deepseek-v41-support
 
+> **2026-09-15 停建**:上游已官方支持 deepseek_v41(本地合并 `a619b22b`),本任务线 superseded,详见 proposal.md 顶部状态说明。以下任务不再实施,仅存档。
+
 ## 1. P0 摸底与基建(动工前提)
 
 - [ ] 1.1 确认 fastllm safetensors reader 的 mmap/懒加载能力(读代码得出结论,不行则列出需要 mmap 的大张量类型清单)

@@ -116,3 +116,4 @@ struct DeepSeekV41SharedAttnState {   // per request, 4 组单槽
 
 - **外部锚**:100B 表全卸载 DRAM + 预取与计算重叠,吞吐最大惩罚 **2.8%**(abstract "<3%")。**限定语:工单层"可信(其设计内)";落地引用前必须回读 arXiv:2601.07372 核对测量口径。** 用途:本变更 `dsv41-hybrid-deployment` 吞吐验收的对标锚(197GB Engram 表 host 驻留的惩罚上限量级)。
 - **仓内核查结论(2026-09-14,替代原"待查项")**:qwen4_exp PLE **无预取重叠机制**——decode/TP 路径为 pinned host + async **同流**拷贝(`qwen4_exp.cpp:3439-3466`,注释自证 "Copy and projections share a stream",异步意在避免同步阻塞与保护 host 缓冲生命周期),prefill 为 host 同步 gather+反量化。028 的"预取与前块计算重叠"对本仓是**真增量**:对症 D3 的 Engram 表读取与已知 FromCPU 流式瓶颈(qwen38fn 踩坑 §5),DSV41 P2 性能期可作候选优化项。
+- **2026-09-15 勘误(上游同步 `a619b22b` 后)**:DSV41 侧的该改进机会已被上游实现吃掉——官方提供 `FASTLLM_DSV41_ENGRAM_PREFETCH=1` 跨层预取(两个 Engram 层行号只依赖 token 历史,进第 0 层前全部确定;后台线程预计算下一层行号并把表行摸进 cache,只看历史窗口快照、不引用请求状态)。**改进机会仅剩 qwen4_exp PLE 侧**(上文核查结论在该侧继续成立:decode/TP 同流拷贝、prefill 同步 gather);2.8% 外部锚继续可用,转作 qwen4_exp PLE 预取化改动的收益对标。

@@ -1,3 +1,6 @@
+> **状态(2026-09-15):SUPERSEDED —— 停建,工件转对拍参考。**
+> 上游 ztxz16/fastllm 已官方支持 `deepseek_v41`(PR #727,随 32 提交同步合入本地 `a619b22b`),覆盖本变更全部四期规划(文本数值对齐 / CPU-hybrid / vision / DSpark,外加 TP2 与 FP4 KV),且已真实权重实测(decode 78ms/token、常驻 ~520GB,见 `docs/deepseek_v41.md`)。34 项任务 0 动工,无沉没实现成本。本目录保留 salvage 价值:design.md D4 哈希 bit-exact spec(99092 压缩词表 / PCG64 乘子 / 素数桶)作上游实现对拍清单,`dsv41-engram` / `dsv41-hybrid-deployment` spec 作验收参考;不再按 tasks.md 实施。
+
 ## Why
 
 DeepSeek-V4.1-Flash(HF `deepseek-ai/DeepSeek-V4.1-Flash`,model_type `deepseek_v41`)是 DeepSeek 最新发布的 730B 级混合专家模型(权重 510GB,48 shards),fastllm 当前只支持 `deepseek_v4`(V4-Pro/V4-Flash),无法加载该模型。该模型的形态——40 层里只有 4 层产生压缩 KV、Engram n-gram 表 197GB、专家 MXFP4 289GB——恰好落在 fastllm 独占的 CPU-hybrid 场景:注意力/共享专家/KV 放单卡 GPU(~15GB),路由专家与 Engram 表驻留大 RAM NUMA 机器,vLLM 同配置需要 8×H100 级集群。vLLM 已于 2026-09-10 将 `deepseek_v4_1` 模型树合入 main(含 Engram CPU offload 默认开启),张量命名、量化格式、哈希算法全部可考,消除了新架构接入的最大不确定性。
