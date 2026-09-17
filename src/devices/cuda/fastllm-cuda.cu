@@ -6245,7 +6245,11 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
         return;
     }
 
-    state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
+    // D2D copies on the same per-thread stream are ordered with the kernels
+    // around them; the blocking cudaMemcpy2D costs ~7us CPU per call and
+    // drains the launch pipeline (decode issues ~200+ of these per token).
+    state = cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height,
+                              cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     checkCudaErrors("Error: CUDA error when 2D copy on GPU!", state);
     DeviceSync();
 }

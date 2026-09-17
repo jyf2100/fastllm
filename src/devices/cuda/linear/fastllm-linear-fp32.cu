@@ -6,6 +6,33 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include <cuda_fp16.h>
+
+// decode (n == 1) fast path: half input + fp32 weight + half output, no
+// temp fp32 roundtrip buffers, no separate conversion kernels. Reduction
+// order and rounding match FastllmGemvFp32Fp32Kernel2 exactly (bit-identical
+// output vs the old convert->gemv->convert chain).
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGemvHalfInFp32WKernel(const half* __restrict__ A, const float* __restrict__ B,
+                                             half* __restrict__ C, const float* __restrict__ bias, int m, int k) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    const int p = blockIdx.x;
+    sdata[tid] = 0;
+    for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+        sdata[tid] += __half2float(A[i]) * B[p * m + i];
+    }
+    __syncthreads();
+    for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
+        if ((tid & (2 * s - 1)) == 0) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        C[p] = __float2half_rz(sdata[0] + bias[p]);
+    }
+}
 
 template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp32Fp32Kernel2(float *A, float *B, float *C, float *bias, int m, int k) {
@@ -117,6 +144,16 @@ bool FastllmCudaHalfMatMulFloat32(const fastllm::Data &input, fastllm::Data &wei
     FastllmCudaFloat32EnsureBiasOnDevice(weight, bias, k);
 
     float *cudaBiasData = (float*)weight.extraCudaData[0];
+    if (n == 1) {
+        // decode GEMV (n == 1): skip the fp32 temp buffers and the
+        // half->float / float->half conversion launches; the kernel converts
+        // inline with identical accumulation order and __float2half_rz.
+        FastllmGemvHalfInFp32WKernel<256> <<< k, 256 >>>(
+            (const half*)input.cudaData, (const float *) weight.cudaData,
+            (half*)output.cudaData, cudaBiasData, m, k);
+        DeviceSync();
+        return true;
+    }
     float *cudaInput = (float*)FastllmCudaMalloc(input.Count(0) * sizeof(float));
     float *cudaOutput = (float*)FastllmCudaMalloc(output.Count(0) * sizeof(float));
     int inputLen = input.Count(0);
