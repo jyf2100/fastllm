@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
@@ -4841,6 +4842,7 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
 }
 
 void FastllmCudaDirectFree(void *ret) {
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
@@ -5189,6 +5191,20 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaGraphCurrentCaptureIdentity();
     const bool capturePoolOnly = captureIdentity.valid ||
         FastllmCudaGraphIsCapturingFast();
+    void *workspacePointer = nullptr;
+    if (fastllm::TryAllocateCudaWorkspace(id, size, &workspacePointer)) {
+        // Arena suballocations have eager stream lifetimes; graph replay must
+        // continue to use the existing graph-owned allocation mechanism.
+        if (capturePoolOnly) {
+            if (workspacePointer) fastllm::TryFreeCudaWorkspace(workspacePointer);
+            FastllmCudaSetThreadError();
+            return nullptr;
+        }
+        if (workspacePointer) return allocationSucceeded(workspacePointer);
+        if (tryResult) *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+        else FastllmCudaSetThreadError();
+        return nullptr;
+    }
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
@@ -5406,6 +5422,7 @@ void FastllmCudaForceFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
@@ -5494,6 +5511,11 @@ bool FastllmCudaFreeAfterStream(void *ret, cudaStream_t stream) {
     if (ret == nullptr) {
         return true;
     }
+    if (fastllm::IsCudaWorkspacePointer(ret)) {
+        cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: synchronizing CUDA workspace release", state);
+        return state == cudaSuccess && fastllm::TryFreeCudaWorkspace(ret);
+    }
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
     if (captureIdentity.valid || FastllmCudaGraphIsCapturingFast()) {
@@ -5560,6 +5582,7 @@ void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
@@ -22402,7 +22425,8 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     size_t scratchUnitBytes = unitBytes;
     void *hData = useBatchedGemm ? nullptr :
         FastllmCudaMalloc(hElems * scratchUnitBytes);
-    void *vNewData = FastllmCudaMalloc(vNewElems * scratchUnitBytes);
+    void *vNewData = useBatchedGemm ? nullptr :
+        FastllmCudaMalloc(vNewElems * scratchUnitBytes);
 
     void *qData = FastllmCudaPrepareInput(q);
     void *kData = FastllmCudaPrepareInput(k);
@@ -22423,15 +22447,25 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         size_t stateElems = (size_t)bhCount * stateStride;
         size_t kScaledTransElems = (size_t)bhCount * chunkWindowCapacity *
                                    kdim * chunk_size;
-        qScaledData = FastllmCudaMalloc(qScaledElems * unitBytes);
-        kScaledTransData = FastllmCudaMalloc(kScaledTransElems * unitBytes);
-        if (!combineQKScale) {
-            gScaleData = (float*)FastllmCudaMalloc(
-                (size_t)bhCount * chunkWindowCapacity * chunk_size *
-                sizeof(float));
-        }
-        gLastExpData = (float*)FastllmCudaMalloc(
-            (size_t)bhCount * chunkWindowCapacity * sizeof(float));
+        auto aligned = [](size_t bytes) { return (bytes + 255) & ~size_t(255); };
+        size_t vBytes = aligned(vNewElems * scratchUnitBytes);
+        size_t qBytes = aligned(qScaledElems * unitBytes);
+        size_t kBytes = aligned(kScaledTransElems * unitBytes);
+        size_t gBytes = combineQKScale ? 0 : aligned(
+            (size_t)bhCount * chunkWindowCapacity * chunk_size * sizeof(float));
+        size_t lastBytes = aligned((size_t)bhCount * chunkWindowCapacity * sizeof(float));
+        // GDN and full attention run sequentially on the same worker stream.
+        // The cuBLAS handle has a separate workspace; borrow the attention
+        // float arena without changing the chunk window or GEMM arithmetic.
+        uint8_t *scratch = (uint8_t *)FastllmBorrowCudaTempBuffer(
+            vBytes + qBytes + kBytes + gBytes + lastBytes, nullptr, nullptr);
+        fastllm::AssertInFastLLM(scratch != nullptr,
+                               "CUDA chunk GDN workspace allocation failed.\n");
+        vNewData = scratch;
+        qScaledData = scratch + vBytes;
+        kScaledTransData = scratch + vBytes + qBytes;
+        if (gBytes) gScaleData = (float *)(scratch + vBytes + qBytes + kBytes);
+        gLastExpData = (float *)(scratch + vBytes + qBytes + kBytes + gBytes);
 
         const int threads = 256;
         int stateScaleBlocks = (int)((stateElems + threads - 1) / threads);
@@ -22741,12 +22775,8 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     FastllmCudaFinishInput(k_cumdecay, kCumData);
     FastllmCudaFinishInput(last_recurrent_state, stateData);
     FastllmCudaFinishOutput(core_attn_out, outData);
-    if (qScaledData != nullptr) FastllmCudaFree(qScaledData);
-    if (kScaledTransData != nullptr) FastllmCudaFree(kScaledTransData);
-    if (gScaleData != nullptr) FastllmCudaFree(gScaleData);
-    if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
     if (hData != nullptr) FastllmCudaFree(hData);
-    if (vNewData != nullptr) FastllmCudaFree(vNewData);
+    if (!useBatchedGemm && vNewData != nullptr) FastllmCudaFree(vNewData);
 }
 
 void FastllmPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex) {

@@ -266,7 +266,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | --- | --- |
 | `model` / `-p, --path` | Hugging Face repository ID, local HF directory, FastLLM model, or configuration file |
 | `--device` | Main compute device; common values are `cpu`, `cuda`, and `numa` |
-| `--vision_device` | Qwen3.5 vision encoder device: `auto` (default, first forward GPU), `cpu`, `cuda`, or `cuda:N`; `cpu` keeps the tower in host RAM and saves VRAM at the cost of slower encoding |
+| `--vision_device` | Qwen3.5 vision encoder device: `auto` (default), `cpu`, `cuda`, or `cuda:N`; with multiple CUDA TP devices, vision follows normal TP and `cuda:N` does not override placement; `cpu` keeps the tower in host RAM and saves VRAM at the cost of slower encoding |
 | `--tp` | CUDA tensor-parallel devices; accepts `0,1`, `2`, or `auto` |
 | `--moe_device` | MoE expert device: `cpu`, `cuda`, `numa`, `disk`, or a weighted combination |
 | `--moe_device_layers` | Apply `--moe_device` only to the last N MoE layers; `-1` means all |
@@ -301,6 +301,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | --- | --- |
 | `--enable_thinking` | Control the model's thinking template when supported |
 | `--mtp` | Draft tokens per step for models with MTP support; `0` disables it and the current maximum is 8 |
+| `--mtp_fp8_draft_head` / `--mtp-fp8-draft-head` | FP8 draft output head for Qwen3.5-family multi-GPU MTP: `1` enables it; `0` reuses the original head to save VRAM, potentially reducing generation speed. Does not change the MTP draft count. An explicit value overrides `FASTLLM_MTP_FP8_DRAFT_HEAD`; otherwise the environment is preserved, with the head enabled by default |
 | `--dspark` | Enable embedded DSpark and set draft tokens per step |
 | `--draft` / `--draft_model_path` | External MTP, DSpark, or DFlash checkpoint; MTP may point directly to `mtp.safetensors` |
 | `--draft_tokens` | Maximum draft tokens per step; defaults to the draft configuration |

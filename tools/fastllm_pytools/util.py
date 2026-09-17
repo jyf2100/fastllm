@@ -483,6 +483,35 @@ def apply_vision_device_env(args):
     os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = _vision_device(device)
 
 
+def apply_multimodal_warmup_env(args, is_qwen35_model):
+    if not getattr(args, "multimodal", False):
+        os.environ.pop("FASTLLM_QWEN35_MM_MAX_PATCHES", None)
+        return
+    if not is_qwen35_model:
+        raise ValueError("--multimodal startup preallocation currently supports Qwen3.5/Qwen3.8 models")
+    try:
+        from .qwen35_multimodal_native import get_qwen35_multimodal_config
+    except ImportError:
+        from qwen35_multimodal_native import get_qwen35_multimodal_config
+    model_config = {}
+    processor_path = args.path
+    if not os.path.isdir(processor_path):
+        processor_path = getattr(args, "ori", "") or os.path.dirname(processor_path)
+    config_path = os.path.join(processor_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as handle:
+            model_config = json.load(handle)
+    config = get_qwen35_multimodal_config(processor_path, model_config)
+    if min(config["patch_size"], config["temporal_patch_size"], config["merge_size"]) <= 0:
+        raise ValueError("Invalid multimodal patch size in processor configuration")
+    patch_area = config["patch_size"] ** 2
+    # Do not divide the video limit by temporal_patch_size: short clips
+    # are padded after resizing and can consume the full pixel budget.
+    max_pixels = max(config["image_max_pixels"], config["video_max_pixels"])
+    max_patches = max((max_pixels + patch_area - 1) // patch_area, config["merge_size"] ** 2)
+    os.environ["FASTLLM_QWEN35_MM_MAX_PATCHES"] = str(max_patches)
+
+
 def _vision_device(value):
     device = str(value).strip().lower() or "auto"
     if device in ("auto", "cpu", "cuda"):
@@ -810,7 +839,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
-                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N (默认 auto, 即首个前向 GPU)')
+                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N；默认auto，CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
+    parser.add_argument('--multimodal', action = 'store_true',
+                        help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
@@ -852,6 +883,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
     parser.add_argument("--lookup", type = int, default = 0, help = "prompt-lookup 草稿数（从 prompt/已生成 token 的 n-gram 重复片段查草稿，零草稿模型），0 表示关闭（默认），当前最大 8；与 --mtp/--dspark/--speculative_algorithm 互斥，仅支持 qwen3_5 族，greedy 无损")
+    parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
+                        type = int, choices = [0, 1], default = None,
+                        help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
     parser.add_argument("--dspark", type = int, default = 0,
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
@@ -1656,6 +1690,7 @@ def make_normal_llm_model(args, startup_progress = None):
     apply_prefix_cache_env(args)
     apply_image_embedding_cache_env(args)
     apply_vision_device_env(args)
+    apply_multimodal_warmup_env(args, is_qwen35_model)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
@@ -1664,6 +1699,10 @@ def make_normal_llm_model(args, startup_progress = None):
     # prompt-lookup 草稿数透传(镜像 FASTLLM_QWEN35_ENABLE_MTP 链路)。
     os.environ["FASTLLM_QWEN35_LOOKUP_DRAFTS"] = str(
         lookup if is_qwen35_model else 0)
+    mtp_fp8_draft_head = getattr(args, "mtp_fp8_draft_head", None)
+    if mtp_fp8_draft_head is not None:
+        # Explicit arguments override the environment; omission preserves it.
+        os.environ["FASTLLM_MTP_FP8_DRAFT_HEAD"] = "1" if _arg_enabled(mtp_fp8_draft_head) else "0"
     # Qwen3.8-Flash-Next 的 FP8 checkpoint 声明 model_type=qwen4_exp（同架构别名），同样启用 MTP
     os.environ["FASTLLM_QWEN4_ENABLE_MTP"] = str(
         mtp if (is_qwen38_flash_next_model or model_type == "qwen4_exp" or

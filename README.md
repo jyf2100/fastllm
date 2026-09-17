@@ -264,7 +264,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | --- | --- |
 | `model` / `-p, --path` | Hugging Face 仓库 ID、本地 HF 目录、FastLLM 模型文件或配置文件 |
 | `--device` | 主计算设备，常用值为 `cpu`、`cuda`、`numa` |
-| `--vision_device` | Qwen3.5 视觉编码器设备：`auto`（默认，首个前向 GPU）、`cpu`、`cuda`、`cuda:N`；`cpu` 时视觉塔权重常驻内存，省显存但编码变慢 |
+| `--vision_device` | Qwen3.5 视觉编码器设备：`auto`（默认）、`cpu`、`cuda`、`cuda:N`；多卡 CUDA 跟随普通 TP，`cuda:N` 不单独覆盖；`cpu` 时视觉塔权重常驻内存，省显存但编码变慢 |
 | `--tp` | CUDA 张量并行设备；支持 `0,1`、`2` 或 `auto` |
 | `--moe_device` | MoE 专家层设备，可使用 `cpu`、`cuda`、`numa`、`disk` 或按比例组合 |
 | `--moe_device_layers` | 仅让最后 N 个 MoE 层使用 `--moe_device`；`-1` 表示全部 |
@@ -301,6 +301,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | --- | --- |
 | `--enable_thinking` | 控制模型的思考模板开关，需要模型支持 |
 | `--mtp` | 支持 MTP 的模型每轮生成的 draft token 数，`0` 关闭，当前最大为 8 |
+| `--mtp_fp8_draft_head` / `--mtp-fp8-draft-head` | Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头开关：`1` 开启，`0` 复用原输出头以节省显存，可能降低生成速度；不改变 MTP draft 数。显式参数优先于 `FASTLLM_MTP_FP8_DRAFT_HEAD`，未指定时沿用环境变量，默认开启 |
 | `--dspark` | 启用模型内置 DSpark，并设置每轮 draft token 数 |
 | `--draft` / `--draft_model_path` | 外部 MTP/DSpark/DFlash draft checkpoint；根据配置自动识别算法，MTP 可直接指定 `mtp.safetensors` |
 | `--draft_tokens` | 每轮最多使用的 draft token 数；未指定时读取 draft 配置 |

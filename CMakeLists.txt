@@ -356,6 +356,8 @@ if (USE_CUDA)
     endif()
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
+        src/devices/cuda/cudaworkspace.cpp
+        src/devices/cuda/fastllm-cuda-vision.cu
         src/devices/cuda/fastllm-cuda.cu
         src/devices/cuda/fastllm-cuda-mtp.cu
         src/devices/cuda/fastllm-triton-cuda.cu
@@ -708,6 +710,19 @@ if (UNIT_TEST)
     target_link_libraries(contextExtensionRegression fastllm)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(multimodal_workspace_test test/basic/test_multimodal_workspace.cpp)
+        target_link_libraries(multimodal_workspace_test PRIVATE fastllm)
+        add_test(NAME multimodal_workspace COMMAND multimodal_workspace_test)
+        set_tests_properties(multimodal_workspace PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(qwen35_vision_tp_test test/basic/test_qwen35_vision_tp.cpp)
+        target_link_libraries(qwen35_vision_tp_test PRIVATE fastllm)
+        add_test(NAME qwen35_vision_tp COMMAND qwen35_vision_tp_test)
+        set_tests_properties(qwen35_vision_tp PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
+        add_executable(qwen35_prefix_managers_test test/basic/test_qwen35_prefix_managers.cpp)
+        target_link_libraries(qwen35_prefix_managers_test PRIVATE fastllm)
+        add_test(NAME qwen35_prefix_managers COMMAND qwen35_prefix_managers_test)
+        # Manager tensors stay on CPU, but Qwen model destruction touches CUDA.
+        set_tests_properties(qwen35_prefix_managers PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 120)
         add_executable(qwen35_mtp_tp_test test/basic/test_qwen35_mtp_tp.cpp)
         target_link_libraries(qwen35_mtp_tp_test PRIVATE fastllm)
         add_test(NAME qwen35_mtp_tp COMMAND qwen35_mtp_tp_test)
@@ -831,6 +846,20 @@ if (UNIT_TEST)
             LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
             ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=256M;FASTLLM_CUDA_FP8_PREFILL_CUBLAS=0")
 
+        # Reuse the FP8 prefill suite for the SM80/86 extension and real MLP shapes.
+        add_test(NAME cuda_fp8_mlp_prefill COMMAND cudaFp8Sm75PrefillRegression 0 mlp)
+        set_tests_properties(cuda_fp8_mlp_prefill PROPERTIES
+            LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+            ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=256M")
+
+        add_executable(cudaFp8MarlinMultiRowRegression test/ops/cudaFp8MarlinMultiRowRegression.cu)
+        target_link_libraries(cudaFp8MarlinMultiRowRegression PRIVATE fastllm)
+        set_target_properties(cudaFp8MarlinMultiRowRegression PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp8_marlin_multirow COMMAND cudaFp8MarlinMultiRowRegression)
+        set_tests_properties(cuda_fp8_marlin_multirow PROPERTIES
+            LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(cudaNvfp4Sm75PrefillRegression test/ops/cudaNvfp4Sm75PrefillRegression.cu)
         target_link_libraries(cudaNvfp4Sm75PrefillRegression PRIVATE fastllm)
         set_target_properties(cudaNvfp4Sm75PrefillRegression PROPERTIES
@@ -916,7 +945,8 @@ if (UNIT_TEST)
             target_link_libraries(customArRegistrationRegression PRIVATE fastllm_tools)
             add_test(NAME custom_ar_registration COMMAND customArRegistrationRegression)
             add_test(NAME custom_ar_registration_pool_reuse COMMAND customArRegistrationRegression reuse)
-            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse PROPERTIES
+            add_test(NAME custom_ar_selftest_upload COMMAND customArRegistrationRegression selftest)
+            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse custom_ar_selftest_upload PROPERTIES
                 LABELS cuda TIMEOUT 30 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         endif()
 
@@ -968,6 +998,21 @@ if (UNIT_TEST)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME ncclOddTp COMMAND ncclOddTpRegression)
         set_tests_properties(ncclOddTp PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_executable(tp2WHT6AllReduceRegression test/ops/tp2WHT6AllReduceRegression.cu)
+        target_include_directories(tp2WHT6AllReduceRegression PRIVATE include)
+        target_link_libraries(tp2WHT6AllReduceRegression PRIVATE nccl Threads::Threads)
+        add_test(NAME tp2WHT6AllReduce COMMAND tp2WHT6AllReduceRegression)
+        set_tests_properties(tp2WHT6AllReduce PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(tp2MlpOverlapRegression test/ops/tp2MlpOverlapRegression.cu)
+        target_include_directories(tp2MlpOverlapRegression PRIVATE include)
+        target_link_libraries(tp2MlpOverlapRegression PRIVATE cublas nccl Threads::Threads)
+        foreach(tp2_backend IN ITEMS nccl wht6)
+            add_test(NAME tp2_mlp_overlap_${tp2_backend} COMMAND tp2MlpOverlapRegression ${tp2_backend})
+            set_tests_properties(tp2_mlp_overlap_${tp2_backend} PROPERTIES
+                LABELS "cuda;multigpu" TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
     endif()
 endif()
 

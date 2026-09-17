@@ -21,6 +21,8 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaWorkspace;
+    struct Qwen35VisionTPState;
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
@@ -100,6 +102,7 @@ namespace fastllm {
         virtual bool NeedAttentionMask(int qlen, int klen);
 
         virtual void WarmUp(); // 预热
+        void Prepare() override; // 在 KV cache 定容前预分配视觉工作区
 
         virtual bool CanUseGPUForward() const override;
 
@@ -362,6 +365,10 @@ namespace fastllm {
         std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
+        bool multimodalWarmedUp = false;
+        int visionWorkspaceMaxPatches = 0;
+        std::shared_ptr<CudaWorkspace> visionWorkspace;
+        std::shared_ptr<Qwen35VisionTPState> visionTP;
         std::string visionDevice = "auto";
         int vision_depth = 0;
         int vision_hidden_size = 0;
@@ -459,6 +466,8 @@ namespace fastllm {
                 std::map<int, int> ratios);
 #endif
         void PrepareVision();
+        void BuildMultimodalTextEmbeddings(const Data &inputIds, Data &hiddenStates);
+        void SplitMultimodalTextEmbeddings(const Data &hiddenStates, int start, int end, Data &chunk);
         Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
                                       const std::vector <int> &seqLens,
                                       bool all1);
@@ -466,7 +475,8 @@ namespace fastllm {
                                              const Data *imageEmbeds,
                                              const Data *videoEmbeds,
                                              Data &hiddenStates);
-        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY);
+        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY,
+                               Data &sinData, Data &cosData);
         void EncodeVisualItems(const std::vector <Data*> &rawInputs,
                                const Data *gridThwData,
                                bool isVideo,
