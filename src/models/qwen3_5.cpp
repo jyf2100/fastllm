@@ -27137,6 +27137,21 @@ namespace fastllm {
         imageEmbeddingCache.reset();
         RestoreGgufGdnWeights(0, block_cnt);
 
+        // llama.cpp squeezes the [1, N] shared-expert router
+        // (ffn_gate_inp_shexp) down to 1-D when writing GGUF files; the
+        // linear consumers require the 2-D [1, N] layout the HF checkpoints
+        // use.  Restore the rank in metadata, mirroring
+        // Qwen4ExpModel::RestoreGgufWeights for qwen4_exp GGUFs.
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const std::string gateName = language_prefix + "layers." +
+                std::to_string(layer) + ".mlp.shared_expert_gate.weight";
+            auto gateIt = this->weight.weight.find(gateName);
+            if (gateIt != this->weight.weight.end() &&
+                gateIt->second.dims.size() == 1) {
+                gateIt->second.Reshape({1, gateIt->second.dims[0]});
+            }
+        }
+
         auto finalNorm = this->weight.weight.find(
             language_prefix + "norm.weight");
         if (finalNorm != this->weight.weight.end() &&

@@ -646,6 +646,36 @@ namespace fastllm {
             }
         }
 
+        // qwen3_5_moe GGUF:上游 qwen3_5 家族的 GGUF 重命名规则目标是
+        // model.language_model.layers.*(见上方 qwen3_5 条目),default 规则的
+        // model.layers.* 会让整模型 397 个权重 unmatched;在 qwen3_5 规则之上
+        // 补路由器/共享专家/打包路由专家的映射(上游仅有 HF 路径,GGUF 缺此规则)。
+        if (archRulesDict.find("qwen35moe") == archRulesDict.end()) {
+            auto rules = originalArchRulesDict["qwen3_5"];
+            const std::vector <GGUFWeightReplaceRule> moeRules = {
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_gate_inp\.weight$)"),
+                    "model.language_model.layers.$1.mlp.gate.weight"
+                ),
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_gate_inp_shexp\.weight$)"),
+                    "model.language_model.layers.$1.mlp.shared_expert_gate.weight"
+                ),
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_shexp\.weight$)"),
+                    "model.language_model.layers.$1.mlp.shared_expert.$2_proj.weight"
+                ),
+                GGUFWeightReplaceRule (
+                    std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$)"),
+                    std::vector <std::string> ({"model.language_model.layers.$1.mlp.experts.", ".$2_proj.weight"}),
+                    GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                ), // routed experts
+            };
+            rules.insert(rules.end(), moeRules.begin(), moeRules.end());
+            archRulesDict["qwen35moe"] = rules;
+            archRulesDict["qwen3_5_moe"] = rules;
+        }
+
         if (archRulesDict.find(arch) != archRulesDict.end()) {
             return archRulesDict[arch];
         }
